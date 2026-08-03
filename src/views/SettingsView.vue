@@ -10,14 +10,13 @@ import { showToast } from '../toast'
 import type { QualityPreset, SystemInfo } from '../types'
 
 const savedTip = ref(false)
+const saving = ref(false)
 const concurrencyInput = ref(String(settings.value.concurrency))
 const intervalInput = ref(String(settings.value.scanIntervalMinutes))
 const qualityPreset = ref<QualityPreset>(settings.value.qualityPreset)
 const autoScanOnLaunch = ref(settings.value.autoScanOnLaunch)
 const systemInfo = ref<SystemInfo | null>(null)
 let tipTimer: number | undefined
-let saveTimer: number | undefined
-let syncing = false
 
 const recommendedConcurrency = computed(() =>
   systemInfo.value ? recommendConcurrency(systemInfo.value.cpuCores) : null,
@@ -32,6 +31,25 @@ const concurrencyHint = computed(() => {
 
 const memoryLabel = computed(() => formatMemory(systemInfo.value?.totalMemoryBytes))
 
+const isDirty = computed(() => {
+  const concurrency = Math.round(Number(concurrencyInput.value))
+  const interval = Math.round(Number(intervalInput.value))
+  if (!Number.isFinite(concurrency) || !Number.isFinite(interval)) return true
+  return (
+    concurrency !== settings.value.concurrency ||
+    interval !== settings.value.scanIntervalMinutes ||
+    qualityPreset.value !== settings.value.qualityPreset ||
+    autoScanOnLaunch.value !== settings.value.autoScanOnLaunch
+  )
+})
+
+function syncFromSaved() {
+  concurrencyInput.value = String(settings.value.concurrency)
+  intervalInput.value = String(settings.value.scanIntervalMinutes)
+  qualityPreset.value = settings.value.qualityPreset
+  autoScanOnLaunch.value = settings.value.autoScanOnLaunch
+}
+
 onMounted(() => {
   void loadSystemInfo().then((info) => {
     systemInfo.value = info
@@ -39,18 +57,11 @@ onMounted(() => {
 })
 
 watch(
-  [settings, settingsReady],
-  () => {
-    syncing = true
-    concurrencyInput.value = String(settings.value.concurrency)
-    intervalInput.value = String(settings.value.scanIntervalMinutes)
-    qualityPreset.value = settings.value.qualityPreset
-    autoScanOnLaunch.value = settings.value.autoScanOnLaunch
-    queueMicrotask(() => {
-      syncing = false
-    })
+  settingsReady,
+  (ready) => {
+    if (ready) syncFromSaved()
   },
-  { deep: true },
+  { immediate: true },
 )
 
 function saveFlash() {
@@ -61,65 +72,47 @@ function saveFlash() {
   }, 1600)
 }
 
-function draftEqualsSaved() {
-  if (!concurrencyInput.value.trim() || !intervalInput.value.trim()) return true
-  const concurrency = Math.min(5, Math.max(1, Math.round(Number(concurrencyInput.value)) || 0))
-  const interval = Math.min(
-    60,
-    Math.max(3, Math.round(Number(intervalInput.value)) || 0),
-  )
-  if (!Number.isFinite(concurrency) || !Number.isFinite(interval)) return true
-  return (
-    concurrency === settings.value.concurrency &&
-    interval === settings.value.scanIntervalMinutes &&
-    qualityPreset.value === settings.value.qualityPreset &&
-    autoScanOnLaunch.value === settings.value.autoScanOnLaunch
-  )
-}
+async function saveSettings() {
+  if (saving.value || !settingsReady.value) return
 
-async function persistNow() {
-  if (draftEqualsSaved()) return
-  syncing = true
+  const concurrency = Math.round(Number(concurrencyInput.value))
+  const interval = Math.round(Number(intervalInput.value))
+  if (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > 5) {
+    showToast({ message: '并行压制数量请填写 1–5', tone: 'danger' })
+    return
+  }
+  if (!Number.isFinite(interval) || interval < 3 || interval > 60) {
+    showToast({ message: '自动扫描间隔请填写 3–60 分钟', tone: 'danger' })
+    return
+  }
+  if (!isDirty.value) {
+    showToast({ message: '没有需要保存的更改', tone: 'info' })
+    return
+  }
+
+  saving.value = true
   try {
     await updateSettings({
-      concurrency: Number(concurrencyInput.value),
-      scanIntervalMinutes: Number(intervalInput.value),
+      concurrency,
+      scanIntervalMinutes: interval,
       qualityPreset: qualityPreset.value,
       autoScanOnLaunch: autoScanOnLaunch.value,
     })
-    concurrencyInput.value = String(settings.value.concurrency)
-    intervalInput.value = String(settings.value.scanIntervalMinutes)
-    qualityPreset.value = settings.value.qualityPreset
-    autoScanOnLaunch.value = settings.value.autoScanOnLaunch
+    syncFromSaved()
     saveFlash()
   } catch {
     showToast({ message: '设置保存失败', tone: 'danger' })
   } finally {
-    queueMicrotask(() => {
-      syncing = false
-    })
+    saving.value = false
   }
 }
 
-function scheduleSave() {
-  if (syncing || !settingsReady.value || draftEqualsSaved()) return
-  if (saveTimer) window.clearTimeout(saveTimer)
-  saveTimer = window.setTimeout(() => {
-    saveTimer = undefined
-    void persistNow()
-  }, 280)
-}
-
-watch([concurrencyInput, intervalInput, qualityPreset, autoScanOnLaunch], () => {
-  scheduleSave()
-})
-
-async function setQuality(preset: QualityPreset) {
+function setQuality(preset: QualityPreset) {
   if (qualityPreset.value === preset) return
   qualityPreset.value = preset
 }
 
-async function setAutoScan(enabled: boolean) {
+function setAutoScan(enabled: boolean) {
   if (autoScanOnLaunch.value === enabled) return
   autoScanOnLaunch.value = enabled
 }
@@ -130,9 +123,20 @@ async function setAutoScan(enabled: boolean) {
     <header class="page-head">
       <div>
         <h1>系统设置</h1>
-        <p>本机配置一览，调整并行压制与其它偏好 · 修改后自动保存</p>
+        <p>本机配置一览，调整并行压制与其它偏好 · 修改后需点击保存</p>
       </div>
-      <p v-if="savedTip" class="saved-pill" aria-live="polite">已保存</p>
+      <div class="head-actions">
+        <p v-if="savedTip" class="saved-pill" aria-live="polite">已保存</p>
+        <p v-else-if="isDirty" class="dirty-pill" aria-live="polite">未保存</p>
+        <button
+          type="button"
+          class="btn btn-primary"
+          :disabled="saving || !settingsReady || !isDirty"
+          @click="saveSettings"
+        >
+          {{ saving ? '保存中…' : '保存设置' }}
+        </button>
+      </div>
     </header>
 
     <section class="panel settings-panel">
@@ -290,15 +294,31 @@ async function setAutoScan(enabled: boolean) {
   overflow: hidden;
 }
 
-.saved-pill {
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.saved-pill,
+.dirty-pill {
   margin: 0;
   padding: 6px 12px;
   border-radius: 999px;
-  background: rgba(110, 231, 183, 0.12);
-  color: var(--ok);
   font-size: 0.82rem;
   font-weight: 650;
   white-space: nowrap;
+}
+
+.saved-pill {
+  background: rgba(110, 231, 183, 0.12);
+  color: var(--ok);
+}
+
+.dirty-pill {
+  background: rgba(240, 180, 41, 0.12);
+  color: var(--warn);
 }
 
 .setting-row {
