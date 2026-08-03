@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "dialog:default",
+    "notification:default",
     "fs:allow-stat",
     "allow-compress-video",
     "allow-prepare-compress-batch",
@@ -21,6 +22,8 @@
     "allow-mark-stale-tasks",
     "allow-load-settings",
     "allow-save-settings",
+    "allow-reveal-path",
+    "allow-get-system-info",
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "**" }]

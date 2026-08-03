@@ -26,3 +26,4 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-notification = "2.3.3"

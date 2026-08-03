@@ -6,8 +6,8 @@
   --line: rgba(148, 197, 189, 0.18);
   --line-strong: rgba(148, 197, 189, 0.32);
   --text: #e8f5f0;
-  --text-muted: #8aa9a3;
-  --text-dim: #5f7c76;
+  --text-muted: #9bb8b1;
+  --text-dim: #7a9a93;
   --accent: #5eead4;
   --accent-deep: #2dd4bf;
   --accent-soft: rgba(94, 234, 212, 0.12);
@@ -89,14 +89,6 @@ button {
   font-size: 0.92rem;
 }
 
-.app {
-  position: relative;
-  width: min(920px, calc(100% - 32px));
-  margin: 0 auto;
-  padding: 40px 0 56px;
-  animation: rise-in 0.55s ease both;
-}
-
 @keyframes rise-in {
   from {
     opacity: 0;
@@ -108,55 +100,27 @@ button {
   }
 }
 
-.topbar {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 28px;
+@media (prefers-reduced-motion: reduce) {
+  .page,
+  .file-item,
+  .dropzone.is-dragover {
+    animation: none !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+  }
 }
 
-.brand {
-  display: grid;
-  gap: 8px;
-}
-
-.brand-mark {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.brand-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  background: linear-gradient(145deg, #1a4d4a, #0f3d3e);
-  box-shadow: inset 0 0 0 1px rgba(94, 234, 212, 0.25);
-  display: grid;
-  place-items: center;
-}
-
-.brand-icon svg {
-  width: 20px;
-  height: 20px;
-}
-
-.brand-name {
-  font-family: "Sora", "Noto Sans SC", sans-serif;
-  font-size: 2rem;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  line-height: 1;
-}
-
-.brand-sub {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.95rem;
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .preset-pill {
+  appearance: none;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -165,10 +129,21 @@ button {
   background: var(--accent-soft);
   color: var(--accent);
   border: 1px solid rgba(94, 234, 212, 0.28);
+  font: inherit;
   font-size: 0.85rem;
   font-weight: 500;
   white-space: nowrap;
-  animation: soft-pulse 2.8s ease-in-out infinite;
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.preset-pill:hover {
+  background: rgba(94, 234, 212, 0.18);
+  border-color: rgba(94, 234, 212, 0.42);
+  color: #9ff5e6;
 }
 
 .preset-pill::before {
@@ -177,17 +152,6 @@ button {
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.5);
-}
-
-@keyframes soft-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(94, 234, 212, 0);
-  }
-  50% {
-    box-shadow: 0 0 0 6px rgba(94, 234, 212, 0.05);
-  }
 }
 
 .panel {
@@ -259,15 +223,26 @@ button {
 
 .btn {
   appearance: none;
-  border: none;
-  border-radius: 12px;
-  padding: 11px 18px;
-  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-size: 0.88rem;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
   transition:
-    transform 0.15s ease,
-    background 0.15s ease,
-    opacity 0.15s ease,
-    box-shadow 0.15s ease;
+    transform 0.14s ease,
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease,
+    opacity 0.14s ease,
+    box-shadow 0.14s ease;
 }
 
 .btn:active:not(:disabled) {
@@ -275,34 +250,96 @@ button {
 }
 
 .btn:disabled {
-  opacity: 0.45;
+  opacity: 0.42;
   cursor: not-allowed;
+  box-shadow: none;
 }
 
+/* 主操作：确定 / 开始 */
 .btn-primary {
-  background: linear-gradient(180deg, #5eead4, #2dd4bf);
-  color: #06221f;
-  box-shadow: 0 10px 24px rgba(45, 212, 191, 0.22);
+  background: linear-gradient(180deg, #6eeee0 0%, #2dd4bf 100%);
+  color: #04221f;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.22) inset,
+    0 8px 20px rgba(45, 212, 191, 0.22);
 }
 
 .btn-primary:hover:not(:disabled) {
-  box-shadow: 0 12px 28px rgba(45, 212, 191, 0.3);
+  background: linear-gradient(180deg, #7af3e6 0%, #34d9c4 100%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.28) inset,
+    0 10px 24px rgba(45, 212, 191, 0.3);
 }
 
+/* 次操作：选择路径 / 立即扫描 */
+.btn-soft {
+  background: rgba(94, 234, 212, 0.1);
+  color: var(--accent);
+  border-color: rgba(94, 234, 212, 0.24);
+}
+
+.btn-soft:hover:not(:disabled) {
+  background: rgba(94, 234, 212, 0.16);
+  border-color: rgba(94, 234, 212, 0.38);
+  color: #9ff5e6;
+}
+
+.btn-soft.is-on {
+  background: rgba(94, 234, 212, 0.16);
+  border-color: rgba(94, 234, 212, 0.4);
+  box-shadow: inset 0 0 0 1px rgba(94, 234, 212, 0.08);
+}
+
+/* 普通描边按钮 */
 .btn-ghost {
-  background: transparent;
-  color: var(--text);
-  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+  border-color: var(--line);
 }
 
 .btn-ghost:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--line-strong);
+}
+
+/* 列表内轻量操作：移除 / 清空 */
+.btn-text {
+  background: transparent;
+  color: var(--text-dim);
+  border-color: transparent;
+  padding: 0 8px;
+}
+
+.btn-text:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 危险轻操作：取消 / 删除 */
+.btn-danger-ghost {
+  background: transparent;
+  color: rgba(248, 113, 113, 0.88);
+  border-color: rgba(248, 113, 113, 0.28);
+}
+
+.btn-danger-ghost:hover:not(:disabled) {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.42);
 }
 
 .btn-sm {
-  padding: 7px 12px;
-  border-radius: 10px;
-  font-size: 0.85rem;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.btn-sm.btn-text {
+  padding: 0 8px;
 }
 
 .list-section {

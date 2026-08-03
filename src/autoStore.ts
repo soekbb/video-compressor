@@ -42,7 +42,7 @@ function applyState(state: PersistState) {
   hydrating = false
 }
 
-async function persistNow() {
+export async function persistAutoStoreNow() {
   if (!isTauri() || !autoStoreReady.value || hydrating) return
   const payload: PersistState = {
     watchDir: autoWatchDir.value,
@@ -60,10 +60,25 @@ function schedulePersist() {
   if (hydrating || !autoStoreReady.value) return
   if (persistTimer) window.clearTimeout(persistTimer)
   persistTimer = window.setTimeout(() => {
-    void persistNow().catch((err) => {
+    void persistAutoStoreNow().catch((err) => {
       console.error('保存自动压制记录失败', err)
     })
   }, 200)
+}
+
+/** 监控目录变更后立即落盘，避免防抖期间退出导致丢失 */
+export async function setAutoWatchDir(dir: string) {
+  autoWatchDir.value = dir
+  if (persistTimer) {
+    window.clearTimeout(persistTimer)
+    persistTimer = undefined
+  }
+  try {
+    await persistAutoStoreNow()
+  } catch (err) {
+    console.error('保存监控目录失败', err)
+    throw err
+  }
 }
 
 export async function initAutoStore() {
@@ -91,7 +106,7 @@ export async function initAutoStore() {
       const legacy = readLegacyLocal()
       applyState(legacy)
       autoStoreReady.value = true
-      await persistNow()
+      await persistAutoStoreNow()
       return
     }
   } catch (err) {

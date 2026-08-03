@@ -1,3 +1,4 @@
+import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { stat } from '@tauri-apps/plugin-fs'
 
@@ -9,6 +10,12 @@ export type PickedVideo = {
 
 export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
+/** 在访达 / 资源管理器中打开目录，或定位到文件 */
+export async function revealPath(path: string): Promise<void> {
+  if (!isTauri() || !path) return
+  await invoke('reveal_path', { path })
 }
 
 function basename(path: string) {

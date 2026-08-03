@@ -31,6 +31,15 @@ export const activeAutoTaskId = ref<string | null>(null)
 type AbortHandler = () => void
 const abortHandlers = new Map<string, AbortHandler>()
 
+/** 全局单任务队列：同时只跑一个，其余保持等待中 */
+type QueuedJob = {
+  taskId: string
+  run: () => Promise<void>
+}
+const jobQueue: QueuedJob[] = []
+let currentRunningId: string | null = null
+let pumping = false
+
 let persistTimer: number | undefined
 const pendingPersist = new Map<string, AppTask>()
 
@@ -136,7 +145,7 @@ export async function createTask(input: {
     id,
     type: input.type,
     title: input.title,
-    status: 'running',
+    status: 'pending',
     progress: 0,
     meta: input.meta ? JSON.stringify(input.meta) : undefined,
     createdAt: ts,
@@ -147,38 +156,188 @@ export async function createTask(input: {
   return id
 }
 
-export function updateTaskProgress(id: string, progress: number) {
-  patchLocal(id, { progress: Math.max(0, Math.min(100, Math.round(progress))) }, false)
+/** 是否已有正在执行或已在执行队列中的任务（不含尚未入队的新任务） */
+export function hasRunningTask() {
+  return (
+    currentRunningId != null ||
+    jobQueue.length > 0 ||
+    tasks.value.some((t) => t.status === 'running')
+  )
 }
 
-function parseMeta(raw?: string): Record<string, unknown> {
+/** 将任务加入全局执行队列；同一时间只执行一个 */
+export function enqueueTaskRun(taskId: string, run: () => Promise<void>) {
+  if (jobQueue.some((j) => j.taskId === taskId)) return
+  jobQueue.push({ taskId, run })
+  void pumpQueue()
+}
+
+function removeQueuedJob(taskId: string) {
+  const idx = jobQueue.findIndex((j) => j.taskId === taskId)
+  if (idx >= 0) jobQueue.splice(idx, 1)
+}
+
+async function pumpQueue() {
+  if (pumping) return
+  pumping = true
+  try {
+    while (jobQueue.length > 0) {
+      const job = jobQueue.shift()!
+      const task = tasks.value.find((t) => t.id === job.taskId)
+      if (!task || task.status === 'cancelled') continue
+
+      currentRunningId = job.taskId
+      patchLocal(job.taskId, { status: 'running', error: undefined }, true)
+      try {
+        await job.run()
+      } catch (e) {
+        const current = tasks.value.find((t) => t.id === job.taskId)
+        if (current?.status === 'running') {
+          failTask(job.taskId, e instanceof Error ? e.message : String(e))
+        }
+      } finally {
+        if (currentRunningId === job.taskId) currentRunningId = null
+      }
+    }
+  } finally {
+    pumping = false
+    if (jobQueue.length > 0) void pumpQueue()
+  }
+}
+
+/** 取消排队中、尚未开始的指定类型任务 */
+export function cancelPendingTasksByType(type: TaskType, reason: string) {
+  const ids = tasks.value
+    .filter((t) => t.type === type && t.status === 'pending')
+    .map((t) => t.id)
+  for (const id of ids) {
+    removeQueuedJob(id)
+    cancelTaskLocal(id, reason)
+  }
+}
+
+export type TaskMeta = {
+  videoCount?: number
+  doneCount?: number
+  outputDir?: string
+  outputPath?: string
+  dramaPath?: string
+  finishedAt?: string
+  durationMs?: number
+  [key: string]: unknown
+}
+
+export function parseTaskMeta(raw?: string): TaskMeta {
   if (!raw) return {}
   try {
-    return JSON.parse(raw) as Record<string, unknown>
+    return JSON.parse(raw) as TaskMeta
   } catch {
     return {}
   }
 }
 
-export function completeTask(id: string, meta?: Record<string, unknown>) {
+function mergeMeta(current: AppTask | undefined, patch?: TaskMeta): string | undefined {
+  if (!patch) return current?.meta
+  return JSON.stringify({ ...parseTaskMeta(current?.meta), ...patch })
+}
+
+function withDuration(current: AppTask | undefined, patch?: TaskMeta): TaskMeta {
+  const finishedAt = nowIso()
+  const started = current ? Date.parse(current.createdAt) : NaN
+  const durationMs = Number.isFinite(started) ? Math.max(0, Date.parse(finishedAt) - started) : 0
+  return { ...patch, finishedAt, durationMs }
+}
+
+export function updateTaskProgress(
+  id: string,
+  progress: number,
+  counts?: { doneCount?: number; videoCount?: number },
+) {
   const current = tasks.value.find((t) => t.id === id)
-  const nextMeta =
-    meta != null ? JSON.stringify({ ...parseMeta(current?.meta), ...meta }) : current?.meta
+  const metaPatch: TaskMeta = {}
+  if (counts?.doneCount != null) metaPatch.doneCount = counts.doneCount
+  if (counts?.videoCount != null) metaPatch.videoCount = counts.videoCount
+  patchLocal(
+    id,
+    {
+      progress: Math.max(0, Math.min(100, Math.round(progress))),
+      ...(Object.keys(metaPatch).length ? { meta: mergeMeta(current, metaPatch) } : {}),
+    },
+    false,
+  )
+}
+
+export function completeTask(id: string, meta?: TaskMeta) {
+  const current = tasks.value.find((t) => t.id === id)
+  const base = parseTaskMeta(current?.meta)
+  const videoCount = Number(meta?.videoCount ?? base.videoCount) || 0
+  const nextMeta = mergeMeta(
+    current,
+    withDuration(current, {
+      ...meta,
+      doneCount: meta?.doneCount ?? videoCount,
+      videoCount: videoCount || base.videoCount,
+    }),
+  )
   patchLocal(id, { status: 'done', progress: 100, error: undefined, meta: nextMeta }, true)
   clearActive(id)
   unregisterAbortHandler(id)
 }
 
 export function failTask(id: string, error: string) {
-  patchLocal(id, { status: 'error', error }, true)
+  const current = tasks.value.find((t) => t.id === id)
+  patchLocal(
+    id,
+    { status: 'error', error, meta: mergeMeta(current, withDuration(current)) },
+    true,
+  )
   clearActive(id)
   unregisterAbortHandler(id)
 }
 
-export function cancelTaskLocal(id: string) {
-  patchLocal(id, { status: 'cancelled', error: '已取消' }, true)
+/** 取消任务；手动取消请传「主动取消」 */
+export function cancelTaskLocal(id: string, reason = '主动取消') {
+  const current = tasks.value.find((t) => t.id === id)
+  patchLocal(
+    id,
+    {
+      status: 'cancelled',
+      error: reason,
+      meta: mergeMeta(current, withDuration(current)),
+    },
+    true,
+  )
   clearActive(id)
   unregisterAbortHandler(id)
+}
+
+/** 失败 / 取消时展示的原因文案 */
+export function taskReason(task: AppTask): string {
+  if (task.status === 'error') return task.error?.trim() || '未知错误'
+  if (task.status === 'cancelled') return task.error?.trim() || '主动取消'
+  return task.error?.trim() || ''
+}
+
+export function resolveDurationMs(task: AppTask): number | undefined {
+  const meta = parseTaskMeta(task.meta)
+  if (meta.durationMs != null && Number.isFinite(Number(meta.durationMs))) {
+    return Math.max(0, Number(meta.durationMs))
+  }
+  const endRaw = meta.finishedAt || task.updatedAt
+  const start = Date.parse(task.createdAt)
+  const end = Date.parse(String(endRaw).replace(' ', 'T'))
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined
+  return end - start
+}
+
+export function formatDuration(ms?: number) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return ''
+  const minutes = ms / 60000
+  if (minutes < 1) return '不到1分钟'
+  // 整分钟直接显示；否则保留1位小数
+  const rounded = Math.round(minutes * 10) / 10
+  if (Number.isInteger(rounded)) return `${rounded}分钟`
+  return `${rounded.toFixed(1)}分钟`
 }
 
 function clearActive(id: string) {
@@ -187,17 +346,25 @@ function clearActive(id: string) {
   if (activeAutoTaskId.value === id) activeAutoTaskId.value = null
 }
 
-export async function cancelTask(id: string) {
+export async function cancelTask(id: string, reason = '主动取消') {
   const task = tasks.value.find((t) => t.id === id)
   if (!task || (task.status !== 'running' && task.status !== 'pending')) return
 
+  removeQueuedJob(id)
   abortHandlers.get(id)?.()
+
+  // 等待中：只移出队列，不触发编码取消
+  if (task.status === 'pending') {
+    cancelTaskLocal(id, reason)
+    return
+  }
+
   try {
-    await cancelCompress()
+    await cancelCompress(id)
   } catch {
     // ignore
   }
-  cancelTaskLocal(id)
+  cancelTaskLocal(id, reason)
 }
 
 export async function removeTask(id: string) {

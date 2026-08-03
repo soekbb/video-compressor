@@ -8,17 +8,23 @@ import {
   initAutoStore,
   isDramaDone,
   markDramaDone,
+  setAutoWatchDir,
 } from '../autoStore'
 import { getCompressConcurrency, compressVideo, prepareCompressBatch } from '../compress'
 import { listDramaFolders } from '../drama'
 import { isTauri, pickOutputDirectory } from '../desktop'
-import { settings } from '../settings'
+import { showDialog } from '../dialog'
+import { initSettings, settings } from '../settings'
 import {
   activeAutoTaskId,
+  cancelPendingTasksByType,
+  cancelTask,
   cancelTaskLocal,
   completeTask,
   createTask,
+  enqueueTaskRun,
   failTask,
+  parseTaskMeta,
   registerAbortHandler,
   tasks,
   unregisterAbortHandler,
@@ -47,21 +53,71 @@ const isWorking = ref(false)
 const scanError = ref('')
 const nextScanIn = ref(0)
 const lastScanAt = ref('')
+/** 立即扫描触发的一次处理，不依赖「自动扫描已开启」 */
+const manualBurst = ref(false)
 let timer: number | undefined
 let countdownTimer: number | undefined
-let abort = false
 
-const pendingFolders = computed(() => folders.value.filter((f) => !isDramaDone(f.path)))
+/** 已完成记录 / 排队中 / 进行中 / 任务列表里已完成或进行中的自动任务，扫描时跳过 */
+function shouldSkipDrama(path: string) {
+  if (isDramaDone(path)) return true
+
+  const local = jobs.value.find((j) => j.path === path)
+  if (local && (local.status === 'queued' || local.status === 'running' || local.status === 'done')) {
+    return true
+  }
+
+  return tasks.value.some((t) => {
+    if (t.type !== 'auto') return false
+    if (parseTaskMeta(t.meta).dramaPath !== path) return false
+    return t.status === 'pending' || t.status === 'running' || t.status === 'done'
+  })
+}
+
+const pendingFolders = computed(() => folders.value.filter((f) => !shouldSkipDrama(f.path)))
+
+const queueJobs = computed(() =>
+  jobs.value.filter((j) => j.status === 'queued' || j.status === 'running' || j.status === 'error'),
+)
+
+const activeJob = computed(() => jobs.value.find((j) => j.status === 'running'))
+
+function jobStatusLabel(status: JobStatus) {
+  if (status === 'queued') return '排队中'
+  if (status === 'running') return '压制中'
+  if (status === 'done') return '已完成'
+  return '失败'
+}
+
+function canProcess() {
+  return autoEnabled.value || manualBurst.value
+}
+
+async function refreshFolderList() {
+  if (!runningInTauri || !autoWatchDir.value) return
+  isScanning.value = true
+  scanError.value = ''
+  try {
+    folders.value = await listDramaFolders(autoWatchDir.value)
+    lastScanAt.value = new Date().toLocaleTimeString()
+  } catch (e) {
+    scanError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    isScanning.value = false
+  }
+}
 
 async function pickWatchDir() {
   const selected = await pickOutputDirectory(autoWatchDir.value || undefined)
   if (selected) {
-    autoWatchDir.value = selected
-    await scanNow()
+    await setAutoWatchDir(selected)
+    // 未开启自动扫描时只刷新列表，不入队、不压制
+    if (autoEnabled.value) await scanNow()
+    else await refreshFolderList()
   }
 }
 
-async function scanNow() {
+async function scanNow(options?: { notify?: boolean }) {
   if (!runningInTauri) {
     scanError.value = '请使用桌面应用'
     return
@@ -75,12 +131,52 @@ async function scanNow() {
   try {
     folders.value = await listDramaFolders(autoWatchDir.value)
     lastScanAt.value = new Date().toLocaleTimeString()
-    enqueuePending()
-    if (autoEnabled.value && !isWorking.value) {
-      void processQueue()
+    const pending = folders.value.filter((f) => !shouldSkipDrama(f.path))
+    // 仅「自动扫描已开启」或「立即扫描」才入队并处理
+    const shouldProcess = autoEnabled.value || Boolean(options?.notify)
+    if (shouldProcess) {
+      enqueuePending()
+      if (pending.length > 0) {
+        if (options?.notify) manualBurst.value = true
+        if (!isWorking.value) void processQueue()
+      }
+    }
+    if (options?.notify) {
+      if (pending.length > 0) {
+        const preview = pending.slice(0, 6)
+        await showDialog({
+          title: '扫描完成',
+          tone: 'ok',
+          message: `发现 ${pending.length} 个待处理剧目，已开始压制`,
+          items: preview.map((f) => ({
+            title: f.name,
+            meta: `${f.videoCount} 个视频`,
+          })),
+          itemsMore: Math.max(0, pending.length - preview.length),
+        })
+      } else if (folders.value.length > 0) {
+        await showDialog({
+          title: '扫描完成',
+          tone: 'info',
+          message: '未找到新剧目\n进行中或已完成的已自动跳过',
+        })
+      } else {
+        await showDialog({
+          title: '扫描完成',
+          tone: 'warn',
+          message: '未找到新文件夹',
+        })
+      }
     }
   } catch (e) {
     scanError.value = e instanceof Error ? e.message : String(e)
+    if (options?.notify) {
+      await showDialog({
+        title: '扫描失败',
+        tone: 'danger',
+        message: scanError.value,
+      })
+    }
   } finally {
     isScanning.value = false
     resetCountdown()
@@ -89,8 +185,11 @@ async function scanNow() {
 
 function enqueuePending() {
   for (const folder of pendingFolders.value) {
+    if (shouldSkipDrama(folder.path)) continue
     const existing = jobs.value.find((j) => j.path === folder.path)
-    if (existing && (existing.status === 'queued' || existing.status === 'running')) continue
+    if (existing && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'done')) {
+      continue
+    }
     jobs.value = [
       ...jobs.value.filter((j) => j.path !== folder.path),
       {
@@ -116,10 +215,13 @@ function updateDramaProgress(
   jobs.value = jobs.value.map((j) =>
     j.path === jobPath ? { ...j, doneCount, progress } : j,
   )
-  if (taskId) updateTaskProgress(taskId, progress)
+  if (taskId) {
+    updateTaskProgress(taskId, progress, { doneCount, videoCount: total })
+  }
 }
 
-async function runDrama(job: DramaJob) {
+/** 创建自动压制任务并加入全局单任务队列（不立刻执行编码） */
+async function submitDrama(job: DramaJob) {
   const folder = folders.value.find((f) => f.path === job.path)
   if (!folder) {
     jobs.value = jobs.value.map((j) =>
@@ -134,103 +236,130 @@ async function runDrama(job: DramaJob) {
       : j,
   )
 
+  let aborted = false
   const taskId = await createTask({
     type: 'auto',
     title: folder.name,
     meta: { dramaPath: folder.path, videoCount: folder.videoCount },
   })
-  activeAutoTaskId.value = taskId
   registerAbortHandler(taskId, () => {
-    abort = true
+    aborted = true
   })
 
   const sep = autoWatchDir.value.includes('\\') ? '\\' : '/'
   const outputDir = `${autoWatchDir.value}${sep}影工输出${sep}${folder.name}`
   const total = folder.videos.length
-  let doneCount = 0
-  let cursor = 0
-  const videoProgress = new Map<string, number>()
 
-  try {
-    await prepareCompressBatch()
-
-    async function worker() {
-      while (!abort && autoEnabled.value) {
-        const index = cursor
-        cursor += 1
-        if (index >= folder!.videos.length) break
-        const video = folder!.videos[index]
-        const id = makeId()
-        videoProgress.set(id, 0)
-
-        await compressVideo({
-          id,
-          inputPath: video.path,
-          outputDir,
-          outputName: toBatchName(video.name),
-          onProgress: (p) => {
-            videoProgress.set(id, p / 100)
-            const partial = [...videoProgress.values()].reduce((a, b) => a + b, 0)
-            updateDramaProgress(job.path, doneCount, total, partial, taskId)
-          },
-        })
-
-        videoProgress.delete(id)
-        doneCount += 1
-        updateDramaProgress(job.path, doneCount, total, 0, taskId)
-      }
-    }
-
-    // 同一时间只跑一个剧目；剧目内按设置并行压制多个视频
-    const pool = Math.min(getCompressConcurrency(), Math.max(1, total))
-    await Promise.all(Array.from({ length: pool }, () => worker()))
-
-    const cancelled = tasks.value.find((t) => t.id === taskId)?.status === 'cancelled'
-    if (abort || !autoEnabled.value || cancelled) {
-      if (!cancelled) cancelTaskLocal(taskId)
+  enqueueTaskRun(taskId, async () => {
+    if (tasks.value.find((t) => t.id === taskId)?.status === 'cancelled' || aborted) {
       jobs.value = jobs.value.map((j) =>
-        j.path === job.path ? { ...j, status: 'error', error: '已停止' } : j,
+        j.path === job.path
+          ? { ...j, status: 'error', error: '主动取消' }
+          : j,
       )
       return
     }
-    if (doneCount < total) throw new Error('剧目未全部完成')
 
-    markDramaDone({
-      path: folder.path,
-      name: folder.name,
-      completedAt: new Date().toLocaleString(),
-      videoCount: folder.videoCount,
-    })
-    jobs.value = jobs.value.map((j) =>
-      j.path === job.path ? { ...j, status: 'done', progress: 100, doneCount: total } : j,
-    )
-    completeTask(taskId, { outputDir })
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e)
-    jobs.value = jobs.value.map((j) =>
-      j.path === job.path ? { ...j, status: 'error', error: message } : j,
-    )
-    const current = tasks.value.find((t) => t.id === taskId)
-    if (current?.status !== 'cancelled') failTask(taskId, message)
-  } finally {
-    unregisterAbortHandler(taskId)
-    if (activeAutoTaskId.value === taskId) activeAutoTaskId.value = null
-  }
+    activeAutoTaskId.value = taskId
+    let doneCount = 0
+    let cursor = 0
+    const videoProgress = new Map<string, number>()
+
+    try {
+      await prepareCompressBatch(taskId)
+
+      async function worker() {
+        while (!aborted) {
+          const index = cursor
+          cursor += 1
+          if (index >= folder!.videos.length) break
+          const video = folder!.videos[index]
+          const id = makeId()
+          videoProgress.set(id, 0)
+
+          await compressVideo({
+            id,
+            cancelKey: taskId,
+            inputPath: video.path,
+            outputDir,
+            outputName: toBatchName(video.name),
+            onProgress: (p) => {
+              videoProgress.set(id, p / 100)
+              const partial = [...videoProgress.values()].reduce((a, b) => a + b, 0)
+              updateDramaProgress(job.path, doneCount, total, partial, taskId)
+            },
+          })
+
+          if (aborted) break
+          videoProgress.delete(id)
+          doneCount += 1
+          updateDramaProgress(job.path, doneCount, total, 0, taskId)
+        }
+      }
+
+      const pool = Math.min(getCompressConcurrency(), Math.max(1, total))
+      await Promise.all(Array.from({ length: pool }, () => worker()))
+
+      const currentTask = tasks.value.find((t) => t.id === taskId)
+      const cancelled = currentTask?.status === 'cancelled'
+      if (aborted || cancelled) {
+        const reason = currentTask?.error || '主动取消'
+        if (!cancelled) cancelTaskLocal(taskId, reason)
+        jobs.value = jobs.value.map((j) =>
+          j.path === job.path ? { ...j, status: 'error', error: reason } : j,
+        )
+        return
+      }
+      if (doneCount < total) throw new Error('剧目未全部完成')
+
+      markDramaDone({
+        path: folder.path,
+        name: folder.name,
+        completedAt: new Date().toLocaleString(),
+        videoCount: folder.videoCount,
+      })
+      jobs.value = jobs.value.map((j) =>
+        j.path === job.path ? { ...j, status: 'done', progress: 100, doneCount: total } : j,
+      )
+      completeTask(taskId, { outputDir, doneCount: total, videoCount: total })
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      const current = tasks.value.find((t) => t.id === taskId)
+      if (current?.status === 'cancelled' || aborted || message.includes('已取消')) {
+        const reason = current?.error || (aborted ? '主动取消' : '任务已中断')
+        if (current?.status !== 'cancelled') cancelTaskLocal(taskId, reason)
+        jobs.value = jobs.value.map((j) =>
+          j.path === job.path ? { ...j, status: 'error', error: reason } : j,
+        )
+        return
+      }
+      const failMessage = message.trim() || '压制失败'
+      jobs.value = jobs.value.map((j) =>
+        j.path === job.path ? { ...j, status: 'error', error: failMessage } : j,
+      )
+      failTask(taskId, failMessage)
+    } finally {
+      unregisterAbortHandler(taskId)
+      if (activeAutoTaskId.value === taskId) activeAutoTaskId.value = null
+    }
+  })
 }
 
 async function processQueue() {
-  if (isWorking.value || !autoEnabled.value) return
+  if (isWorking.value || !canProcess()) return
   isWorking.value = true
 
-  // 自动压制：同一时间只执行一个剧目；取消单条后继续后续队列
-  while (autoEnabled.value) {
-    const next = jobs.value.find((j) => j.status === 'queued')
-    if (!next) break
-    abort = false
-    await runDrama(next)
+  try {
+    // 只负责把剧目提交进全局任务队列；真正执行由单任务泵串行
+    while (canProcess()) {
+      const next = jobs.value.find((j) => j.status === 'queued')
+      if (!next) break
+      await submitDrama(next)
+    }
+  } finally {
+    isWorking.value = false
+    manualBurst.value = false
   }
-
-  isWorking.value = false
 }
 
 function resetCountdown() {
@@ -257,15 +386,40 @@ function stopTimers() {
 }
 
 async function toggleEnabled() {
-  autoEnabled.value = !autoEnabled.value
-  if (autoEnabled.value) {
+  if (!autoEnabled.value) {
+    if (!autoWatchDir.value) {
+      await showDialog({
+        title: '请先选择监控目录',
+        tone: 'warn',
+        message: '启用自动扫描前，请先选择要监听的剧目根目录。',
+      })
+      return
+    }
+    autoEnabled.value = true
     await scanNow()
     startTimers()
     void processQueue()
-  } else {
-    abort = true
-    stopTimers()
+    return
   }
+
+  autoEnabled.value = false
+  manualBurst.value = false
+  stopTimers()
+  const pendingDramaPaths = new Set(
+    tasks.value
+      .filter((t) => t.type === 'auto' && t.status === 'pending')
+      .map((t) => String(parseTaskMeta(t.meta).dramaPath || '')),
+  )
+  cancelPendingTasksByType('auto', '自动扫描已关闭，任务已取消')
+  if (activeAutoTaskId.value) {
+    await cancelTask(activeAutoTaskId.value, '自动扫描已关闭，当前压制已停止')
+  }
+  jobs.value = jobs.value.map((j) => {
+    if (j.status === 'queued' || (j.status === 'running' && pendingDramaPaths.has(j.path))) {
+      return { ...j, status: 'error', error: '自动扫描已关闭，任务已取消' }
+    }
+    return j
+  })
 }
 
 function formatCountdown(sec: number) {
@@ -275,9 +429,21 @@ function formatCountdown(sec: number) {
 }
 
 onMounted(async () => {
-  await initAutoStore()
-  if (autoWatchDir.value) await scanNow()
-  if (autoEnabled.value) startTimers()
+  await Promise.all([initAutoStore(), initSettings()])
+  // 未选择监控目录时不允许保持自动扫描开启
+  if (!autoWatchDir.value && autoEnabled.value) {
+    autoEnabled.value = false
+  }
+  // 「启动时自动扫描」开启且已有监控目录时，才自动启用
+  if (settings.value.autoScanOnLaunch && autoWatchDir.value) {
+    autoEnabled.value = true
+  }
+  // 只有开启了自动扫描才在启动时扫描；否则不主动扫目录
+  if (autoEnabled.value && autoWatchDir.value) {
+    await scanNow()
+    startTimers()
+    void processQueue()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -292,14 +458,16 @@ onBeforeUnmount(() => {
       <div>
         <h1>自动压制</h1>
         <p>
-          同时只压制一个剧目；剧目内按设置并行处理视频。每
+          需先选择监控目录，再启用自动扫描。同时只压制一个剧目；每
           {{ settings.scanIntervalMinutes }} 分钟扫描一次
         </p>
       </div>
       <button
         type="button"
         class="btn"
-        :class="autoEnabled ? 'btn-primary' : 'btn-ghost'"
+        :class="autoEnabled ? 'btn-soft is-on' : 'btn-primary'"
+        :disabled="!autoEnabled && !autoWatchDir"
+        :title="!autoEnabled && !autoWatchDir ? '请先选择监控目录' : undefined"
         @click="toggleEnabled"
       >
         {{ autoEnabled ? '自动扫描已开启' : '启用自动扫描' }}
@@ -310,19 +478,25 @@ onBeforeUnmount(() => {
       <div class="controls" style="border-top: none">
         <div class="output-row">
           <div class="output-field">
-            <span class="output-label">监控目录</span>
+            <span class="output-label">监控目录（必选）</span>
             <p class="output-path" :class="{ 'is-placeholder': !autoWatchDir }">
-              {{ autoWatchDir || '选择包含多个剧目文件夹的根目录' }}
+              {{ autoWatchDir || '请先选择包含多个剧目文件夹的根目录' }}
             </p>
           </div>
-          <button type="button" class="btn btn-ghost" @click="pickWatchDir">选择监控目录</button>
+          <button type="button" class="btn btn-soft" @click="pickWatchDir">选择监控目录</button>
         </div>
         <div class="action-row">
           <p class="hint">
-            每个子文件夹视为一个剧目。输出到
+            每个子文件夹视为一个剧目。监控目录会自动保存。输出到
             <code>监控目录/影工输出/剧目名/</code>，并记录已完成，避免重复压制。
           </p>
-          <button type="button" class="btn btn-ghost" :disabled="isScanning" @click="scanNow">
+          <button
+            type="button"
+            class="btn btn-soft"
+            :disabled="isScanning || !autoWatchDir"
+            :title="!autoWatchDir ? '请先选择监控目录' : undefined"
+            @click="scanNow({ notify: true })"
+          >
             {{ isScanning ? '扫描中…' : '立即扫描' }}
           </button>
         </div>
@@ -332,17 +506,67 @@ onBeforeUnmount(() => {
           <template v-if="autoEnabled"> · 下次扫描 {{ formatCountdown(nextScanIn) }}</template>
         </p>
         <div class="action-row">
-          <p class="hint">进度与结果请到「任务列表」查看</p>
+          <p class="hint">
+            <template v-if="activeJob">
+              正在处理「{{ activeJob.name }}」· {{ activeJob.progress }}%
+            </template>
+            <template v-else>详细记录也可在「任务列表」查看</template>
+          </p>
           <button
             v-if="autoDone.length"
             type="button"
-            class="btn btn-ghost btn-sm"
+            class="btn btn-text btn-sm"
             @click="clearAutoDone"
           >
             清空已完成记录
           </button>
         </div>
         <p v-if="scanError" class="summary err">{{ scanError }}</p>
+      </div>
+
+      <div class="list-section queue-section">
+        <div class="list-head">
+          <h3>当前队列</h3>
+          <span>{{ queueJobs.length }} 个</span>
+        </div>
+        <p v-if="!queueJobs.length" class="empty-hint">
+          暂无排队或进行中的剧目。扫描到新文件夹后会显示在这里。
+        </p>
+        <ul v-else class="file-list auto-queue">
+          <li v-for="job in queueJobs" :key="job.path" class="file-item">
+            <div class="file-meta">
+              <p class="file-name" :title="job.name">{{ job.name }}</p>
+              <p class="file-sub">
+                {{ job.doneCount }} / {{ job.videoCount }} 个视频
+                <template v-if="job.error"> · {{ job.error }}</template>
+              </p>
+            </div>
+            <div class="file-actions">
+              <span
+                class="status"
+                :class="{
+                  'status-pending': job.status === 'queued',
+                  'status-running': job.status === 'running',
+                  'status-error': job.status === 'error',
+                  'status-done': job.status === 'done',
+                }"
+              >
+                {{ jobStatusLabel(job.status) }}
+                <template v-if="job.status === 'running'"> {{ job.progress }}%</template>
+              </span>
+            </div>
+            <div
+              v-if="job.status === 'running'"
+              class="progress"
+              role="progressbar"
+              :aria-valuenow="job.progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+            >
+              <i :style="{ width: `${job.progress}%` }" />
+            </div>
+          </li>
+        </ul>
       </div>
     </section>
   </div>
@@ -351,5 +575,13 @@ onBeforeUnmount(() => {
 <style scoped>
 .err {
   color: var(--danger);
+}
+
+.queue-section {
+  border-top: 1px solid var(--line);
+}
+
+.auto-queue {
+  max-height: 320px;
 }
 </style>

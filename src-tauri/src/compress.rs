@@ -1,11 +1,37 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 后台持续排空 stderr，避免管道写满导致 FFmpeg 阻塞卡死。
+pub fn spawn_stderr_collector(stderr: impl Read + Send + 'static) -> JoinHandle<String> {
+  std::thread::spawn(move || {
+    let mut buf = String::new();
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    loop {
+      line.clear();
+      match reader.read_line(&mut line) {
+        Ok(0) => break,
+        Ok(_) => {
+          // 只保留尾部，避免异常刷屏占内存
+          if buf.len() + line.len() > 64 * 1024 {
+            let keep_from = buf.len().saturating_sub(32 * 1024);
+            buf = buf.split_off(keep_from);
+          }
+          buf.push_str(&line);
+        }
+        Err(_) => break,
+      }
+    }
+    buf
+  })
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,13 +48,118 @@ pub struct CompressResult {
 }
 
 pub struct CompressState {
-  pub cancel: AtomicBool,
+  /// 按任务 cancelKey 取消，互不影响其它任务
+  cancelled: Mutex<HashSet<String>>,
+}
+
+impl CompressState {
+  pub fn request_cancel(&self, key: &str) {
+    if key.is_empty() {
+      return;
+    }
+    if let Ok(mut set) = self.cancelled.lock() {
+      set.insert(key.to_string());
+    }
+  }
+
+  pub fn clear_cancel(&self, key: &str) {
+    if key.is_empty() {
+      return;
+    }
+    if let Ok(mut set) = self.cancelled.lock() {
+      set.remove(key);
+    }
+  }
+
+  pub fn is_cancelled(&self, key: &str) -> bool {
+    if key.is_empty() {
+      return false;
+    }
+    self.cancelled
+      .lock()
+      .map(|set| set.contains(key))
+      .unwrap_or(false)
+  }
+}
+
+/// 返回 (crf, x264_preset, audio_bitrate)。
+/// 画质档位只影响码率与编码速度，绝不改分辨率（调用方不得加 `-s` / `scale`）。
+pub fn encode_params(quality_preset: &str) -> (&'static str, &'static str, &'static str) {
+  match quality_preset {
+    // 画质优先：更清晰，编码稍慢
+    "quality" => ("18", "medium", "192k"),
+    // 体积优先：温和压缩（CRF23≈常见均衡），faster 提速；避免 CRF28 压得过狠
+    _ => ("23", "faster", "128k"),
+  }
+}
+
+/// 读取视频流宽高（coded width/height）。
+pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), String> {
+  let output = Command::new(ffprobe)
+    .args([
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=width,height",
+      "-of",
+      "csv=p=0:s=x",
+      input.to_string_lossy().as_ref(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .map_err(|e| format!("探测分辨率失败：{e}"))?;
+
+  if !output.status.success() {
+    return Err("无法读取视频分辨率".into());
+  }
+
+  let text = String::from_utf8_lossy(&output.stdout);
+  let line = text
+    .lines()
+    .map(str::trim)
+    .find(|l| !l.is_empty())
+    .ok_or_else(|| "无法读取视频分辨率".to_string())?;
+
+  let (w, h) = line
+    .split_once('x')
+    .ok_or_else(|| format!("分辨率格式无效：{line}"))?;
+  let width: u32 = w
+    .trim()
+    .parse()
+    .map_err(|_| format!("无效宽度：{w}"))?;
+  let height: u32 = h
+    .trim()
+    .parse()
+    .map_err(|_| format!("无效高度：{h}"))?;
+  if width == 0 || height == 0 {
+    return Err("视频分辨率为 0".into());
+  }
+  Ok((width, height))
+}
+
+/// 校验输出与期望分辨率一致（压制/合成均须保持原分辨率）。
+pub fn assert_resolution(
+  ffprobe: &Path,
+  path: &Path,
+  expected: (u32, u32),
+) -> Result<(), String> {
+  let got = probe_video_size(ffprobe, path)?;
+  if got != expected {
+    return Err(format!(
+      "输出分辨率被改变：期望 {}×{}，实际 {}×{}（已保证不缩放，请重试或检查源文件）",
+      expected.0, expected.1, got.0, got.1
+    ));
+  }
+  Ok(())
 }
 
 impl Default for CompressState {
   fn default() -> Self {
     Self {
-      cancel: AtomicBool::new(false),
+      cancelled: Mutex::new(HashSet::new()),
     }
   }
 }
@@ -103,6 +234,27 @@ fn resolve_bin(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
   Err(format!(
     "未找到 {name}。打包前请执行 npm run prepare:ffmpeg；开发调试也可 brew install ffmpeg"
   ))
+}
+
+/// 应用异常退出 / 热重载后，原先 spawn 的 FFmpeg 可能成孤儿进程继续跑。
+/// 启动时按本应用捆绑的 ffmpeg 路径清理残留，避免任务已中断但编码仍占 CPU。
+pub fn cleanup_orphan_ffmpeg(app: &AppHandle) {
+  let Ok(ffmpeg) = resolve_bin(app, "ffmpeg") else {
+    return;
+  };
+  let path = ffmpeg.to_string_lossy().to_string();
+  if path.is_empty() {
+    return;
+  }
+  #[cfg(unix)]
+  {
+    // 只匹配本应用二进制路径，避免误杀系统 ffmpeg
+    let _ = Command::new("pkill")
+      .args(["-f", &path])
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status();
+  }
 }
 
 fn probe_duration_secs(ffprobe: &Path, input: &Path) -> Option<f64> {
@@ -180,6 +332,9 @@ pub async fn compress_video(
   input_path: String,
   output_dir: String,
   output_name: String,
+  quality_preset: Option<String>,
+  // 任务级取消键；同一任务内并行视频共享，互不影响其它任务
+  cancel_key: Option<String>,
 ) -> Result<CompressResult, String> {
   if input_path.starts_with("browser://") {
     return Err("浏览器模式无法写出文件，请使用桌面应用并通过「选择文件」添加视频".into());
@@ -201,31 +356,38 @@ pub async fn compress_video(
   let output_path = output_dir_path.join(&output_name);
   let ffmpeg = resolve_bin(&app, "ffmpeg")?;
   let ffprobe = resolve_bin(&app, "ffprobe")?;
+  let input_wh = probe_video_size(&ffprobe, &input)?;
   let duration = probe_duration_secs(&ffprobe, &input);
   let cancel = Arc::clone(&state);
-  // 不在单任务开始时重置 cancel，避免并行任务互相干扰
+  let cancel_key = cancel_key.unwrap_or_else(|| id.clone());
 
   let app_for_progress = app.clone();
   let id_for_progress = id.clone();
   let output_path_clone = output_path.clone();
+  let ffprobe_for_check = ffprobe.clone();
+  let preset = quality_preset.unwrap_or_else(|| "size".into());
+  let (crf, x264_preset, audio_bitrate) = encode_params(&preset);
 
   let result = tauri::async_runtime::spawn_blocking(move || {
+    // 不传 -s / -vf scale：无论体积优先还是画质优先，分辨率与源一致
     let mut child = Command::new(&ffmpeg)
       .args([
         "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-i",
         input.to_string_lossy().as_ref(),
-        // 画质优先：较低 CRF，不缩放分辨率
         "-c:v",
         "libx264",
         "-crf",
-        "18",
+        crf,
         "-preset",
-        "slow",
+        x264_preset,
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        audio_bitrate,
         "-movflags",
         "+faststart",
         "-progress",
@@ -242,17 +404,19 @@ pub async fn compress_video(
       .stdout
       .take()
       .ok_or_else(|| "无法读取 FFmpeg 进度输出".to_string())?;
-    let mut stderr = child
+    let stderr = child
       .stderr
       .take()
       .ok_or_else(|| "无法读取 FFmpeg 错误输出".to_string())?;
+    let stderr_worker = spawn_stderr_collector(stderr);
 
     let reader = BufReader::new(stdout);
     let mut last_progress = 0_u32;
 
     for line in reader.lines().flatten() {
-      if cancel.cancel.load(Ordering::SeqCst) {
+      if cancel.is_cancelled(&cancel_key) {
         let _ = child.kill();
+        let _ = stderr_worker.join();
         return Err("已取消压缩".into());
       }
 
@@ -289,10 +453,13 @@ pub async fn compress_video(
     let status = child
       .wait()
       .map_err(|e| format!("等待 FFmpeg 结束失败：{e}"))?;
+    let err_buf = stderr_worker.join().unwrap_or_default();
+
+    if cancel.is_cancelled(&cancel_key) {
+      return Err("已取消压缩".into());
+    }
 
     if !status.success() {
-      let mut err_buf = String::new();
-      let _ = stderr.read_to_string(&mut err_buf);
       let detail = err_buf
         .lines()
         .rev()
@@ -304,6 +471,8 @@ pub async fn compress_video(
     if !output_path_clone.is_file() {
       return Err("压缩完成但未找到输出文件".into());
     }
+
+    assert_resolution(&ffprobe_for_check, &output_path_clone, input_wh)?;
 
     let output_size = fs::metadata(&output_path_clone)
       .map(|m| m.len())
@@ -329,11 +498,11 @@ pub async fn compress_video(
 }
 
 #[tauri::command]
-pub fn prepare_compress_batch(state: State<'_, Arc<CompressState>>) {
-  state.cancel.store(false, Ordering::SeqCst);
+pub fn prepare_compress_batch(state: State<'_, Arc<CompressState>>, cancel_key: String) {
+  state.clear_cancel(&cancel_key);
 }
 
 #[tauri::command]
-pub fn cancel_compress(state: State<'_, Arc<CompressState>>) {
-  state.cancel.store(true, Ordering::SeqCst);
+pub fn cancel_compress(state: State<'_, Arc<CompressState>>, cancel_key: String) {
+  state.request_cancel(&cancel_key);
 }

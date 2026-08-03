@@ -1,13 +1,14 @@
 use serde::Serialize;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::compress::CompressState;
+use crate::compress::{
+  assert_resolution, encode_params, probe_video_size, spawn_stderr_collector, CompressState,
+};
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"];
 
@@ -40,6 +41,214 @@ pub struct MergeProgressPayload {
 pub struct MergeResult {
   pub output_path: String,
   pub output_size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoDimensions {
+  pub width: u32,
+  pub height: u32,
+}
+
+fn even_dim(n: u32) -> u32 {
+  let v = (n / 2) * 2;
+  if v == 0 {
+    2
+  } else {
+    v
+  }
+}
+
+/// 用于判断 concat 是否可 stream copy（参数不一致则必须重编码）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamFingerprint {
+  width: u32,
+  height: u32,
+  video_codec: String,
+  pix_fmt: String,
+  video_profile: String,
+  has_audio: bool,
+  audio_codec: String,
+  sample_rate: String,
+  channels: String,
+}
+
+/// ffprobe csv 字段顺序不稳定（常把 profile 插到 width 前），改用 key=value。
+fn ffprobe_entries(
+  ffprobe: &Path,
+  input: &Path,
+  select: &str,
+  entries: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+  let output = Command::new(ffprobe)
+    .args([
+      "-v",
+      "error",
+      "-select_streams",
+      select,
+      "-show_entries",
+      entries,
+      "-of",
+      "default=noprint_wrappers=1:nokey=0",
+      input.to_string_lossy().as_ref(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  let mut map = std::collections::HashMap::new();
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let line = line.trim();
+    if line.is_empty() {
+      continue;
+    }
+    if let Some((k, v)) = line.split_once('=') {
+      map.insert(k.trim().to_string(), v.trim().to_string());
+    }
+  }
+  if map.is_empty() {
+    None
+  } else {
+    Some(map)
+  }
+}
+
+fn map_get_lc(map: &std::collections::HashMap<String, String>, key: &str) -> String {
+  map
+    .get(key)
+    .map(|v| v.trim().to_ascii_lowercase())
+    .filter(|v| !v.is_empty() && v != "n/a" && v != "unknown")
+    .unwrap_or_default()
+}
+
+fn probe_stream_fingerprint(ffprobe: &Path, input: &Path) -> Result<StreamFingerprint, String> {
+  let video = ffprobe_entries(
+    ffprobe,
+    input,
+    "v:0",
+    "stream=codec_name,width,height,pix_fmt,profile",
+  )
+  .ok_or_else(|| format!("无法读取视频流：{}", input.display()))?;
+
+  let video_codec = map_get_lc(&video, "codec_name");
+  let width: u32 = video
+    .get("width")
+    .and_then(|v| v.trim().parse().ok())
+    .ok_or_else(|| format!("无法读取宽度：{}", input.display()))?;
+  let height: u32 = video
+    .get("height")
+    .and_then(|v| v.trim().parse().ok())
+    .ok_or_else(|| format!("无法读取高度：{}", input.display()))?;
+  let pix_fmt = map_get_lc(&video, "pix_fmt");
+  let video_profile = map_get_lc(&video, "profile");
+
+  if video_codec.is_empty() || width == 0 || height == 0 {
+    return Err(format!("视频流无效：{}", input.display()));
+  }
+
+  let audio = ffprobe_entries(
+    ffprobe,
+    input,
+    "a:0",
+    "stream=codec_name,sample_rate,channels",
+  );
+  let (has_audio, audio_codec, sample_rate, channels) = match audio {
+    Some(map) => {
+      let codec = map_get_lc(&map, "codec_name");
+      if codec.is_empty() {
+        (false, String::new(), String::new(), String::new())
+      } else {
+        (
+          true,
+          codec,
+          map.get("sample_rate").cloned().unwrap_or_default(),
+          map.get("channels").cloned().unwrap_or_default(),
+        )
+      }
+    }
+    None => (false, String::new(), String::new(), String::new()),
+  };
+
+  Ok(StreamFingerprint {
+    width,
+    height,
+    video_codec,
+    pix_fmt,
+    video_profile,
+    has_audio,
+    audio_codec,
+    sample_rate,
+    channels,
+  })
+}
+
+fn can_stream_copy(fingerprints: &[StreamFingerprint]) -> bool {
+  let Some(first) = fingerprints.first() else {
+    return false;
+  };
+  // 无音频轨时也可 copy；但各片是否有音频、音频参数必须完全一致
+  fingerprints.iter().all(|fp| fp == first)
+}
+
+/// 将各片段缩放到同一分辨率后 concat（用于分辨率不一致时）。
+fn build_normalize_filter(
+  count: usize,
+  width: u32,
+  height: u32,
+  has_audio: &[bool],
+  durations: &[f64],
+) -> (String, bool) {
+  let any_audio = has_audio.iter().any(|v| *v);
+  let mut parts: Vec<String> = Vec::new();
+
+  for i in 0..count {
+    parts.push(format!(
+      "[{i}:v]scale={width}:{height}:flags=bicubic,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v{i}]"
+    ));
+    if any_audio {
+      if has_audio.get(i).copied().unwrap_or(false) {
+        parts.push(format!(
+          "[{i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
+        ));
+      } else {
+        let dur = durations.get(i).copied().unwrap_or(1.0).max(0.1);
+        parts.push(format!(
+          "anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:{dur},asetpts=PTS-STARTPTS[a{i}]"
+        ));
+      }
+    }
+  }
+
+  let mut concat_in = String::new();
+  for i in 0..count {
+    concat_in.push_str(&format!("[v{i}]"));
+    if any_audio {
+      concat_in.push_str(&format!("[a{i}]"));
+    }
+  }
+  if any_audio {
+    parts.push(format!(
+      "{concat_in}concat=n={count}:v=1:a=1[outv][outa]"
+    ));
+  } else {
+    parts.push(format!("{concat_in}concat=n={count}:v=1:a=0[outv]"));
+  }
+
+  (parts.join(";"), any_audio)
+}
+
+#[tauri::command]
+pub fn probe_video_dimensions(app: AppHandle, path: String) -> Result<VideoDimensions, String> {
+  let ffprobe = resolve_bin(&app, "ffprobe")?;
+  let input = PathBuf::from(&path);
+  if !input.is_file() {
+    return Err(format!("找不到文件：{path}"));
+  }
+  let (width, height) = probe_video_size(&ffprobe, &input)?;
+  Ok(VideoDimensions { width, height })
 }
 
 fn looks_runnable(path: &Path) -> bool {
@@ -197,6 +406,18 @@ fn parse_out_time_secs(line: &str) -> Option<f64> {
     }
     return raw.parse::<f64>().ok().map(|us| us / 1_000_000.0);
   }
+  if let Some(value) = line.strip_prefix("out_time=") {
+    let raw = value.trim();
+    if raw == "N/A" {
+      return None;
+    }
+    // 形如 00:01:23.456789
+    let mut parts = raw.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    return Some(hours * 3600.0 + minutes * 60.0 + seconds);
+  }
   None
 }
 
@@ -237,6 +458,9 @@ pub async fn merge_videos(
   input_paths: Vec<String>,
   output_dir: String,
   output_name: String,
+  quality_preset: Option<String>,
+  normalize_resolution: Option<bool>,
+  cancel_key: Option<String>,
 ) -> Result<MergeResult, String> {
   if input_paths.len() < 2 {
     return Err("请至少选择两个视频进行合成".into());
@@ -250,110 +474,198 @@ pub async fn merge_videos(
   let output_path = output_dir_path.join(&output_name);
   let ffmpeg = resolve_bin(&app, "ffmpeg")?;
   let ffprobe = resolve_bin(&app, "ffprobe")?;
+  let normalize = normalize_resolution.unwrap_or(false);
 
   let mut total_duration = 0.0_f64;
+  let mut sizes: Vec<(u32, u32)> = Vec::new();
+  let mut durations: Vec<f64> = Vec::new();
+  let mut has_audio: Vec<bool> = Vec::new();
+  let mut fingerprints: Vec<StreamFingerprint> = Vec::new();
   for path in &input_paths {
     let p = PathBuf::from(path);
     if !p.is_file() {
       return Err(format!("找不到输入文件：{path}"));
     }
-    if let Some(secs) = probe_duration_secs(&ffprobe, &p) {
-      total_duration += secs;
-    }
+    let fp = probe_stream_fingerprint(&ffprobe, &p)?;
+    sizes.push((fp.width, fp.height));
+    has_audio.push(fp.has_audio);
+    fingerprints.push(fp);
+    let secs = probe_duration_secs(&ffprobe, &p).unwrap_or(0.0);
+    durations.push(secs);
+    total_duration += secs;
   }
 
-  let list_path = std::env::temp_dir().join(format!("kuaiya-concat-{id}.txt"));
-  {
-    let mut file = fs::File::create(&list_path).map_err(|e| format!("无法创建合成列表：{e}"))?;
-    for path in &input_paths {
-      writeln!(file, "file '{}'", escape_concat_path(path))
-        .map_err(|e| format!("写入合成列表失败：{e}"))?;
-    }
+  let first_wh = sizes[0];
+  let mismatched = sizes.iter().any(|wh| *wh != first_wh);
+  if mismatched && !normalize {
+    return Err(format!(
+      "所选视频分辨率不同，无法直接合成（首个为 {}×{}）。请统一分辨率后再试",
+      first_wh.0, first_wh.1
+    ));
   }
 
+  let target_wh = (even_dim(first_wh.0), even_dim(first_wh.1));
+  let assert_wh = if mismatched { target_wh } else { first_wh };
+  // 分辨率不一致需缩放 → 只能重编码；否则参数完全一致可无损拼接
+  let prefer_copy = !mismatched && can_stream_copy(&fingerprints);
   let cancel = Arc::clone(&state);
+  let cancel_key = cancel_key.unwrap_or_else(|| id.clone());
   let app_for_progress = app.clone();
   let id_for_progress = id.clone();
   let output_path_clone = output_path.clone();
-  let list_path_clone = list_path.clone();
+  let ffprobe_for_check = ffprobe.clone();
+  let preset = quality_preset.unwrap_or_else(|| "size".into());
+  let (crf, x264_preset, audio_bitrate) = encode_params(&preset);
+  let input_paths_clone = input_paths.clone();
 
   let result = tauri::async_runtime::spawn_blocking(move || {
-    let mut child = Command::new(&ffmpeg)
-      .args([
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        list_path_clone.to_string_lossy().as_ref(),
-        "-c:v",
-        "libx264",
-        "-crf",
-        "18",
-        "-preset",
-        "slow",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+    let list_path = std::env::temp_dir().join(format!("kuaiya-concat-{id}.txt"));
+
+    let write_concat_list = || -> Result<(), String> {
+      let mut file =
+        fs::File::create(&list_path).map_err(|e| format!("无法创建合成列表：{e}"))?;
+      for path in &input_paths_clone {
+        writeln!(file, "file '{}'", escape_concat_path(path))
+          .map_err(|e| format!("写入合成列表失败：{e}"))?;
+      }
+      Ok(())
+    };
+
+    let run_once = |stream_copy: bool| -> Result<(), String> {
+      let mut cmd = Command::new(&ffmpeg);
+      cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+      let mut map_audio = true;
+
+      if mismatched {
+        for path in &input_paths_clone {
+          cmd.arg("-i").arg(path);
+        }
+        let (filter, with_audio) = build_normalize_filter(
+          input_paths_clone.len(),
+          target_wh.0,
+          target_wh.1,
+          &has_audio,
+          &durations,
+        );
+        cmd.args(["-filter_complex", &filter, "-map", "[outv]"]);
+        if with_audio {
+          cmd.args(["-map", "[outa]"]);
+        } else {
+          map_audio = false;
+        }
+        cmd.args(["-c:v", "libx264", "-crf", crf, "-preset", x264_preset]);
+        if map_audio {
+          cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+        }
+      } else {
+        write_concat_list()?;
+        cmd.args([
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          list_path.to_string_lossy().as_ref(),
+        ]);
+        if stream_copy {
+          cmd.args(["-c", "copy"]);
+        } else {
+          cmd.args(["-c:v", "libx264", "-crf", crf, "-preset", x264_preset]);
+          // 与历史行为一致：concat 重编码时统一转 AAC
+          cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+        }
+      }
+
+      cmd.args([
         "-movflags",
         "+faststart",
         "-progress",
         "pipe:1",
         "-nostats",
         output_path_clone.to_string_lossy().as_ref(),
-      ])
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .map_err(|e| format!("启动 FFmpeg 合成失败：{e}"))?;
+      ]);
 
-    let stdout = child.stdout.take().ok_or_else(|| "无法读取进度".to_string())?;
-    let mut stderr = child.stderr.take().ok_or_else(|| "无法读取错误输出".to_string())?;
-    let reader = BufReader::new(stdout);
-    let mut last_progress = 0_u32;
+      let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 FFmpeg 合成失败：{e}"))?;
 
-    for line in reader.lines().flatten() {
-      if cancel.cancel.load(Ordering::SeqCst) {
-        let _ = child.kill();
-        let _ = fs::remove_file(&list_path_clone);
-        return Err("已取消合成".into());
+      let stdout = child.stdout.take().ok_or_else(|| "无法读取进度".to_string())?;
+      let stderr = child.stderr.take().ok_or_else(|| "无法读取错误输出".to_string())?;
+      let stderr_worker = spawn_stderr_collector(stderr);
+      let reader = BufReader::new(stdout);
+      let mut last_progress = 0_u32;
+
+      for line in reader.lines().flatten() {
+        if cancel.is_cancelled(&cancel_key) {
+          let _ = child.kill();
+          let _ = stderr_worker.join();
+          let _ = fs::remove_file(&list_path);
+          let _ = fs::remove_file(&output_path_clone);
+          return Err("已取消合成".into());
+        }
+        if let Some(out_secs) = parse_out_time_secs(&line) {
+          let progress = if total_duration > 0.0 {
+            (((out_secs / total_duration).clamp(0.0, 1.0) * 100.0).floor() as u32).min(99)
+          } else if last_progress < 95 {
+            last_progress + 1
+          } else {
+            last_progress
+          };
+          if progress > last_progress {
+            last_progress = progress;
+            let _ = app_for_progress.emit(
+              "merge-progress",
+              MergeProgressPayload {
+                id: id_for_progress.clone(),
+                progress,
+              },
+            );
+          }
+        }
       }
-      if let Some(out_secs) = parse_out_time_secs(&line) {
-        let progress = if total_duration > 0.0 {
-          (((out_secs / total_duration).clamp(0.0, 1.0) * 100.0).floor() as u32).min(99)
-        } else if last_progress < 95 {
-          last_progress + 1
-        } else {
-          last_progress
-        };
-        if progress > last_progress {
-          last_progress = progress;
+
+      let status = child.wait().map_err(|e| format!("等待合成结束失败：{e}"))?;
+      let err_buf = stderr_worker.join().unwrap_or_default();
+      let _ = fs::remove_file(&list_path);
+
+      if !status.success() {
+        let _ = fs::remove_file(&output_path_clone);
+        let detail = err_buf
+          .lines()
+          .rev()
+          .find(|l| !l.trim().is_empty())
+          .unwrap_or("合成失败");
+        return Err(format!("合成失败：{detail}"));
+      }
+      Ok(())
+    };
+
+    if prefer_copy {
+      match run_once(true) {
+        Ok(()) => {}
+        Err(e) => {
+          if cancel.is_cancelled(&cancel_key) || e.contains("已取消") {
+            return Err(e);
+          }
+          // 探测认为可 copy 但封装失败（罕见参数差异）→ 回退重编码
+          let _ = fs::remove_file(&output_path_clone);
           let _ = app_for_progress.emit(
             "merge-progress",
             MergeProgressPayload {
               id: id_for_progress.clone(),
-              progress,
+              progress: 0,
             },
           );
+          run_once(false)?;
         }
       }
+    } else {
+      run_once(false)?;
     }
 
-    let status = child.wait().map_err(|e| format!("等待合成结束失败：{e}"))?;
-    let _ = fs::remove_file(&list_path_clone);
-
-    if !status.success() {
-      let mut err_buf = String::new();
-      let _ = stderr.read_to_string(&mut err_buf);
-      let detail = err_buf
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("合成失败");
-      return Err(format!("合成失败：{detail}"));
-    }
+    assert_resolution(&ffprobe_for_check, &output_path_clone, assert_wh)?;
 
     let output_size = fs::metadata(&output_path_clone)
       .map(|m| m.len())

@@ -1,21 +1,27 @@
 import { invoke } from '@tauri-apps/api/core'
 import { ref } from 'vue'
 import { isTauri } from './desktop'
-import type { AppSettings } from './types'
+import type { AppSettings, QualityPreset } from './types'
 
 const STORAGE_KEY = 'kuaiya-settings'
 
 const defaults: AppSettings = {
-  concurrency: 2,
+  concurrency: 1,
   scanIntervalMinutes: 3,
+  qualityPreset: 'size',
+  autoScanOnLaunch: false,
 }
 
 function clampConcurrency(n: number) {
-  return Math.min(5, Math.max(1, Math.round(Number(n)) || 2))
+  return Math.min(5, Math.max(1, Math.round(Number(n)) || 1))
 }
 
 function clampInterval(n: number) {
   return Math.min(60, Math.max(3, Math.round(Number(n)) || 3))
+}
+
+function normalizePreset(v: unknown): QualityPreset {
+  return v === 'quality' ? 'quality' : 'size'
 }
 
 function normalize(partial: Partial<AppSettings>): AppSettings {
@@ -24,6 +30,8 @@ function normalize(partial: Partial<AppSettings>): AppSettings {
     scanIntervalMinutes: clampInterval(
       partial.scanIntervalMinutes ?? defaults.scanIntervalMinutes,
     ),
+    qualityPreset: normalizePreset(partial.qualityPreset ?? defaults.qualityPreset),
+    autoScanOnLaunch: Boolean(partial.autoScanOnLaunch ?? defaults.autoScanOnLaunch),
   }
 }
 
@@ -49,6 +57,8 @@ async function persist(value: AppSettings) {
     settings: {
       concurrency: value.concurrency,
       scanIntervalMinutes: value.scanIntervalMinutes,
+      qualityPreset: value.qualityPreset,
+      autoScanOnLaunch: value.autoScanOnLaunch,
     },
   })
 }
@@ -62,23 +72,7 @@ export async function initSettings() {
 
   try {
     const loaded = await invoke<AppSettings>('load_settings')
-    let next = normalize(loaded)
-
-    // 若仍是默认值，尝试迁移旧 localStorage 配置一次
-    const legacy = readLocalFallback()
-    if (
-      legacy &&
-      loaded.concurrency === defaults.concurrency &&
-      loaded.scanIntervalMinutes === defaults.scanIntervalMinutes &&
-      (legacy.concurrency !== defaults.concurrency ||
-        legacy.scanIntervalMinutes !== defaults.scanIntervalMinutes)
-    ) {
-      next = legacy
-      await persist(next)
-      localStorage.removeItem(STORAGE_KEY)
-    }
-
-    settings.value = next
+    settings.value = normalize(loaded)
   } catch (e) {
     console.error('加载设置失败', e)
     settings.value = readLocalFallback() ?? { ...defaults }
@@ -91,6 +85,8 @@ export async function updateSettings(patch: Partial<AppSettings>) {
   const next = normalize({
     concurrency: patch.concurrency ?? settings.value.concurrency,
     scanIntervalMinutes: patch.scanIntervalMinutes ?? settings.value.scanIntervalMinutes,
+    qualityPreset: patch.qualityPreset ?? settings.value.qualityPreset,
+    autoScanOnLaunch: patch.autoScanOnLaunch ?? settings.value.autoScanOnLaunch,
   })
   settings.value = next
   try {
@@ -103,4 +99,12 @@ export async function updateSettings(patch: Partial<AppSettings>) {
 
 export function getConcurrency() {
   return settings.value.concurrency
+}
+
+export function getQualityPreset(): QualityPreset {
+  return settings.value.qualityPreset
+}
+
+export function qualityPresetLabel(preset: QualityPreset = settings.value.qualityPreset) {
+  return preset === 'quality' ? '画质优先' : '体积优先'
 }

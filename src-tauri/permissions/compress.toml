@@ -67,3 +67,13 @@ commands.allow = ["load_settings"]
 identifier = "allow-save-settings"
 description = "允许保存系统设置"
 commands.allow = ["save_settings"]
+
+[[permission]]
+identifier = "allow-reveal-path"
+description = "允许在文件管理器中打开路径"
+commands.allow = ["reveal_path"]
+
+[[permission]]
+identifier = "allow-get-system-info"
+description = "允许读取本机配置信息"
+commands.allow = ["get_system_info"]
