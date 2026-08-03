@@ -7,7 +7,11 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::compress::{
-  assert_resolution, encode_params, probe_video_size, spawn_stderr_collector, CompressState,
+  assert_resolution, probe_video_size, spawn_stderr_collector, CompressState,
+};
+use crate::encode::{
+  append_audio_aac_args, append_audio_aac_unified_args, append_video_encode_args,
+  encoder_fallback_chain, VideoEncoderKind,
 };
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"];
@@ -191,6 +195,29 @@ fn can_stream_copy(fingerprints: &[StreamFingerprint]) -> bool {
   };
   // 无音频轨时也可 copy；但各片是否有音频、音频参数必须完全一致
   fingerprints.iter().all(|fp| fp == first)
+}
+
+fn can_copy_video(fingerprints: &[StreamFingerprint]) -> bool {
+  let Some(first) = fingerprints.first() else {
+    return false;
+  };
+  fingerprints.iter().all(|fp| {
+    fp.width == first.width
+      && fp.height == first.height
+      && fp.video_codec == first.video_codec
+      && fp.pix_fmt == first.pix_fmt
+      && fp.video_profile == first.video_profile
+  })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConcatStrategy {
+  /// 音视频全部 copy
+  FullCopy,
+  /// 视频 copy，音频统一重编码为 AAC 48k 立体声
+  VideoCopyAudioEncode,
+  /// 全量重编码（硬编优先）
+  FullReencode,
 }
 
 /// 将各片段缩放到同一分辨率后 concat（用于分辨率不一致时）。
@@ -506,8 +533,10 @@ pub async fn merge_videos(
 
   let target_wh = (even_dim(first_wh.0), even_dim(first_wh.1));
   let assert_wh = if mismatched { target_wh } else { first_wh };
-  // 分辨率不一致需缩放 → 只能重编码；否则参数完全一致可无损拼接
-  let prefer_copy = !mismatched && can_stream_copy(&fingerprints);
+  let video_copy_ok = !mismatched && can_copy_video(&fingerprints);
+  let full_copy_ok = video_copy_ok && can_stream_copy(&fingerprints);
+  let all_have_audio = !has_audio.is_empty() && has_audio.iter().all(|v| *v);
+  let none_have_audio = has_audio.iter().all(|v| !*v);
   let cancel = Arc::clone(&state);
   let cancel_key = cancel_key.unwrap_or_else(|| id.clone());
   let app_for_progress = app.clone();
@@ -515,7 +544,6 @@ pub async fn merge_videos(
   let output_path_clone = output_path.clone();
   let ffprobe_for_check = ffprobe.clone();
   let preset = quality_preset.unwrap_or_else(|| "size".into());
-  let (crf, x264_preset, audio_bitrate) = encode_params(&preset);
   let input_paths_clone = input_paths.clone();
 
   let result = tauri::async_runtime::spawn_blocking(move || {
@@ -531,7 +559,7 @@ pub async fn merge_videos(
       Ok(())
     };
 
-    let run_once = |stream_copy: bool| -> Result<(), String> {
+    let run_once = |strategy: ConcatStrategy, encoder: VideoEncoderKind| -> Result<(), String> {
       let mut cmd = Command::new(&ffmpeg);
       cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
       let mut map_audio = true;
@@ -553,9 +581,9 @@ pub async fn merge_videos(
         } else {
           map_audio = false;
         }
-        cmd.args(["-c:v", "libx264", "-crf", crf, "-preset", x264_preset]);
+        append_video_encode_args(&mut cmd, encoder, &preset, target_wh.0, target_wh.1);
         if map_audio {
-          cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+          append_audio_aac_args(&mut cmd, &preset);
         }
       } else {
         write_concat_list()?;
@@ -567,12 +595,28 @@ pub async fn merge_videos(
           "-i",
           list_path.to_string_lossy().as_ref(),
         ]);
-        if stream_copy {
-          cmd.args(["-c", "copy"]);
-        } else {
-          cmd.args(["-c:v", "libx264", "-crf", crf, "-preset", x264_preset]);
-          // 与历史行为一致：concat 重编码时统一转 AAC
-          cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+        match strategy {
+          ConcatStrategy::FullCopy => {
+            cmd.args(["-c", "copy"]);
+          }
+          ConcatStrategy::VideoCopyAudioEncode => {
+            cmd.args(["-c:v", "copy"]);
+            append_audio_aac_unified_args(&mut cmd, &preset);
+          }
+          ConcatStrategy::FullReencode => {
+            append_video_encode_args(
+              &mut cmd,
+              encoder,
+              &preset,
+              first_wh.0,
+              first_wh.1,
+            );
+            if none_have_audio {
+              cmd.arg("-an");
+            } else {
+              append_audio_aac_unified_args(&mut cmd, &preset);
+            }
+          }
         }
       }
 
@@ -642,27 +686,71 @@ pub async fn merge_videos(
       Ok(())
     };
 
-    if prefer_copy {
-      match run_once(true) {
-        Ok(()) => {}
-        Err(e) => {
-          if cancel.is_cancelled(&cancel_key) || e.contains("已取消") {
-            return Err(e);
+    let reset_progress = || {
+      let _ = fs::remove_file(&output_path_clone);
+      let _ = app_for_progress.emit(
+        "merge-progress",
+        MergeProgressPayload {
+          id: id_for_progress.clone(),
+          progress: 0,
+        },
+      );
+    };
+
+    let mut strategies: Vec<ConcatStrategy> = Vec::new();
+    if mismatched {
+      strategies.push(ConcatStrategy::FullReencode);
+    } else {
+      if full_copy_ok {
+        strategies.push(ConcatStrategy::FullCopy);
+      }
+      // 视频一致、音频不一致；或全 copy 失败后再试「视频 copy + 转音频」
+      if all_have_audio && video_copy_ok {
+        strategies.push(ConcatStrategy::VideoCopyAudioEncode);
+      }
+      strategies.push(ConcatStrategy::FullReencode);
+    }
+
+    let mut last_err = String::from("合成失败");
+    let mut done = false;
+    'strategy: for strategy in strategies {
+      if cancel.is_cancelled(&cancel_key) {
+        return Err("已取消合成".into());
+      }
+
+      let encoders = match strategy {
+        ConcatStrategy::FullCopy | ConcatStrategy::VideoCopyAudioEncode => {
+          vec![VideoEncoderKind::X264] // 占位，copy 路径不使用
+        }
+        ConcatStrategy::FullReencode => encoder_fallback_chain(&ffmpeg),
+      };
+
+      for encoder in encoders {
+        match run_once(strategy, encoder) {
+          Ok(()) => {
+            done = true;
+            break 'strategy;
           }
-          // 探测认为可 copy 但封装失败（罕见参数差异）→ 回退重编码
-          let _ = fs::remove_file(&output_path_clone);
-          let _ = app_for_progress.emit(
-            "merge-progress",
-            MergeProgressPayload {
-              id: id_for_progress.clone(),
-              progress: 0,
-            },
-          );
-          run_once(false)?;
+          Err(e) => {
+            if cancel.is_cancelled(&cancel_key) || e.contains("已取消") {
+              return Err(e);
+            }
+            last_err = e;
+            reset_progress();
+            // copy 类策略不轮询硬编；FullReencode 硬编失败继续软编
+            if strategy != ConcatStrategy::FullReencode {
+              break;
+            }
+            if encoder == VideoEncoderKind::X264 {
+              break;
+            }
+          }
         }
       }
-    } else {
-      run_once(false)?;
+    }
+
+    if !done {
+      return Err(last_err);
     }
 
     assert_resolution(&ffprobe_for_check, &output_path_clone, assert_wh)?;

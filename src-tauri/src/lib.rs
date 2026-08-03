@@ -1,4 +1,5 @@
 mod compress;
+mod encode;
 mod media;
 mod persist;
 mod reveal;

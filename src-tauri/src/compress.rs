@@ -82,17 +82,6 @@ impl CompressState {
   }
 }
 
-/// 返回 (crf, x264_preset, audio_bitrate)。
-/// 画质档位只影响码率与编码速度，绝不改分辨率（调用方不得加 `-s` / `scale`）。
-pub fn encode_params(quality_preset: &str) -> (&'static str, &'static str, &'static str) {
-  match quality_preset {
-    // 画质优先：更清晰，编码稍慢
-    "quality" => ("18", "medium", "192k"),
-    // 体积优先：温和压缩（CRF23≈常见均衡），faster 提速；避免 CRF28 压得过狠
-    _ => ("23", "faster", "128k"),
-  }
-}
-
 /// 读取视频流宽高（coded width/height）。
 pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), String> {
   let output = Command::new(ffprobe)
@@ -366,130 +355,160 @@ pub async fn compress_video(
   let output_path_clone = output_path.clone();
   let ffprobe_for_check = ffprobe.clone();
   let preset = quality_preset.unwrap_or_else(|| "size".into());
-  let (crf, x264_preset, audio_bitrate) = encode_params(&preset);
 
   let result = tauri::async_runtime::spawn_blocking(move || {
-    // 不传 -s / -vf scale：无论体积优先还是画质优先，分辨率与源一致
-    let mut child = Command::new(&ffmpeg)
-      .args([
+    use crate::encode::{
+      append_audio_aac_args, append_video_encode_args, encoder_fallback_chain, VideoEncoderKind,
+    };
+
+    let encoders = encoder_fallback_chain(&ffmpeg);
+    let mut last_err = String::from("压缩失败");
+
+    for (attempt, encoder) in encoders.into_iter().enumerate() {
+      if cancel.is_cancelled(&cancel_key) {
+        return Err("已取消压缩".into());
+      }
+      if attempt > 0 {
+        let _ = fs::remove_file(&output_path_clone);
+        let _ = app_for_progress.emit(
+          "compress-progress",
+          CompressProgressPayload {
+            id: id_for_progress.clone(),
+            progress: 0,
+          },
+        );
+      }
+
+      let mut cmd = Command::new(&ffmpeg);
+      cmd.args([
         "-y",
         "-hide_banner",
         "-loglevel",
         "error",
         "-i",
         input.to_string_lossy().as_ref(),
-        "-c:v",
-        "libx264",
-        "-crf",
-        crf,
-        "-preset",
-        x264_preset,
-        "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
+      ]);
+      // 不传 -s / -vf scale：分辨率与源一致
+      append_video_encode_args(&mut cmd, encoder, &preset, input_wh.0, input_wh.1);
+      append_audio_aac_args(&mut cmd, &preset);
+      cmd.args([
         "-movflags",
         "+faststart",
         "-progress",
         "pipe:1",
         "-nostats",
         output_path_clone.to_string_lossy().as_ref(),
-      ])
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .map_err(|e| format!("启动 FFmpeg 失败：{e}"))?;
+      ]);
 
-    let stdout = child
-      .stdout
-      .take()
-      .ok_or_else(|| "无法读取 FFmpeg 进度输出".to_string())?;
-    let stderr = child
-      .stderr
-      .take()
-      .ok_or_else(|| "无法读取 FFmpeg 错误输出".to_string())?;
-    let stderr_worker = spawn_stderr_collector(stderr);
+      let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 FFmpeg 失败：{e}"))?;
 
-    let reader = BufReader::new(stdout);
-    let mut last_progress = 0_u32;
+      let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 FFmpeg 进度输出".to_string())?;
+      let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取 FFmpeg 错误输出".to_string())?;
+      let stderr_worker = spawn_stderr_collector(stderr);
 
-    for line in reader.lines().flatten() {
+      let reader = BufReader::new(stdout);
+      let mut last_progress = 0_u32;
+
+      for line in reader.lines().flatten() {
+        if cancel.is_cancelled(&cancel_key) {
+          let _ = child.kill();
+          let _ = stderr_worker.join();
+          let _ = fs::remove_file(&output_path_clone);
+          return Err("已取消压缩".into());
+        }
+
+        if let Some(out_secs) = parse_out_time_secs(&line) {
+          let progress = match duration {
+            Some(total) if total > 0.0 => {
+              let ratio = (out_secs / total).clamp(0.0, 1.0);
+              ((ratio * 100.0).floor() as u32).min(99)
+            }
+            _ => {
+              if last_progress < 95 {
+                last_progress.saturating_add(1)
+              } else {
+                last_progress
+              }
+            }
+          };
+
+          if progress > last_progress {
+            last_progress = progress;
+            let _ = app_for_progress.emit(
+              "compress-progress",
+              CompressProgressPayload {
+                id: id_for_progress.clone(),
+                progress,
+              },
+            );
+          }
+        }
+      }
+
+      let status = child
+        .wait()
+        .map_err(|e| format!("等待 FFmpeg 结束失败：{e}"))?;
+      let err_buf = stderr_worker.join().unwrap_or_default();
+
       if cancel.is_cancelled(&cancel_key) {
-        let _ = child.kill();
-        let _ = stderr_worker.join();
+        let _ = fs::remove_file(&output_path_clone);
         return Err("已取消压缩".into());
       }
 
-      if let Some(out_secs) = parse_out_time_secs(&line) {
-        let progress = match duration {
-          Some(total) if total > 0.0 => {
-            let ratio = (out_secs / total).clamp(0.0, 1.0);
-            // 编码未结束前最多到 99，完成时再设 100
-            ((ratio * 100.0).floor() as u32).min(99)
+      if status.success() && output_path_clone.is_file() {
+        if let Err(e) = assert_resolution(&ffprobe_for_check, &output_path_clone, input_wh) {
+          last_err = e;
+          let _ = fs::remove_file(&output_path_clone);
+          // 硬编分辨率异常时继续回退；软编失败则直接返回
+          if encoder == VideoEncoderKind::X264 {
+            return Err(last_err);
           }
-          // 拿不到总时长时用不确定进度，缓慢爬升，避免瞬间顶满
-          _ => {
-            if last_progress < 95 {
-              last_progress.saturating_add(1)
-            } else {
-              last_progress
-            }
-          }
-        };
-
-        if progress > last_progress {
-          last_progress = progress;
-          let _ = app_for_progress.emit(
-            "compress-progress",
-            CompressProgressPayload {
-              id: id_for_progress.clone(),
-              progress,
-            },
-          );
+          continue;
         }
+
+        let output_size = fs::metadata(&output_path_clone)
+          .map(|m| m.len())
+          .unwrap_or(0);
+
+        let _ = app_for_progress.emit(
+          "compress-progress",
+          CompressProgressPayload {
+            id: id_for_progress,
+            progress: 100,
+          },
+        );
+
+        return Ok(CompressResult {
+          output_path: output_path_clone.to_string_lossy().to_string(),
+          output_size,
+        });
       }
-    }
 
-    let status = child
-      .wait()
-      .map_err(|e| format!("等待 FFmpeg 结束失败：{e}"))?;
-    let err_buf = stderr_worker.join().unwrap_or_default();
-
-    if cancel.is_cancelled(&cancel_key) {
-      return Err("已取消压缩".into());
-    }
-
-    if !status.success() {
       let detail = err_buf
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("FFmpeg 压缩失败");
-      return Err(format!("压缩失败：{detail}"));
+      last_err = format!("压缩失败（{}）：{detail}", encoder.ffmpeg_name());
+      let _ = fs::remove_file(&output_path_clone);
+
+      if encoder == VideoEncoderKind::X264 {
+        break;
+      }
+      // 硬编失败 → 下一档（软编）
     }
 
-    if !output_path_clone.is_file() {
-      return Err("压缩完成但未找到输出文件".into());
-    }
-
-    assert_resolution(&ffprobe_for_check, &output_path_clone, input_wh)?;
-
-    let output_size = fs::metadata(&output_path_clone)
-      .map(|m| m.len())
-      .unwrap_or(0);
-
-    let _ = app_for_progress.emit(
-      "compress-progress",
-      CompressProgressPayload {
-        id: id_for_progress,
-        progress: 100,
-      },
-    );
-
-    Ok(CompressResult {
-      output_path: output_path_clone.to_string_lossy().to_string(),
-      output_size,
-    })
+    Err(last_err)
   })
   .await
   .map_err(|e| format!("压缩任务异常：{e}"))?;
