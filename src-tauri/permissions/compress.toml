@@ -1,0 +1,69 @@
+[[permission]]
+identifier = "allow-compress-video"
+description = "允许调用 compress_video 进行视频压缩"
+commands.allow = ["compress_video"]
+
+[[permission]]
+identifier = "allow-prepare-compress-batch"
+description = "允许调用 prepare_compress_batch 开始一批压缩"
+commands.allow = ["prepare_compress_batch"]
+
+[[permission]]
+identifier = "allow-cancel-compress"
+description = "允许调用 cancel_compress 取消压缩"
+commands.allow = ["cancel_compress"]
+
+[[permission]]
+identifier = "allow-merge-videos"
+description = "允许调用 merge_videos 合成视频"
+commands.allow = ["merge_videos"]
+
+[[permission]]
+identifier = "allow-list-drama-folders"
+description = "允许调用 list_drama_folders 扫描剧目目录"
+commands.allow = ["list_drama_folders"]
+
+[[permission]]
+identifier = "allow-load-auto-state"
+description = "允许读取自动压制本地记录"
+commands.allow = ["load_auto_state"]
+
+[[permission]]
+identifier = "allow-save-auto-state"
+description = "允许写入自动压制本地记录"
+commands.allow = ["save_auto_state"]
+
+[[permission]]
+identifier = "allow-list-tasks"
+description = "允许读取任务列表"
+commands.allow = ["list_tasks"]
+
+[[permission]]
+identifier = "allow-upsert-task"
+description = "允许创建或更新任务"
+commands.allow = ["upsert_task"]
+
+[[permission]]
+identifier = "allow-delete-task"
+description = "允许删除单条任务"
+commands.allow = ["delete_task"]
+
+[[permission]]
+identifier = "allow-delete-finished-tasks"
+description = "允许清空已结束任务"
+commands.allow = ["delete_finished_tasks"]
+
+[[permission]]
+identifier = "allow-mark-stale-tasks"
+description = "允许标记残留任务为已取消"
+commands.allow = ["mark_stale_tasks"]
+
+[[permission]]
+identifier = "allow-load-settings"
+description = "允许读取系统设置"
+commands.allow = ["load_settings"]
+
+[[permission]]
+identifier = "allow-save-settings"
+description = "允许保存系统设置"
+commands.allow = ["save_settings"]
