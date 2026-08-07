@@ -358,7 +358,8 @@ pub async fn compress_video(
 
   let result = tauri::async_runtime::spawn_blocking(move || {
     use crate::encode::{
-      append_audio_aac_args, append_video_encode_args, encoder_fallback_chain, VideoEncoderKind,
+      append_audio_aac_args, append_video_encode_args, encoder_fallback_chain,
+      mark_hw_encoder_failed, VideoEncoderKind,
     };
 
     let encoders = encoder_fallback_chain(&ffmpeg);
@@ -505,7 +506,8 @@ pub async fn compress_video(
       if encoder == VideoEncoderKind::X264 {
         break;
       }
-      // 硬编失败 → 下一档（软编）
+      // 硬编失败：本进程后续任务直接软编，避免每个文件都先失败一次
+      mark_hw_encoder_failed();
     }
 
     Err(last_err)

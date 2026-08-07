@@ -11,7 +11,7 @@ use crate::compress::{
 };
 use crate::encode::{
   append_audio_aac_args, append_audio_aac_unified_args, append_video_encode_args,
-  encoder_fallback_chain, VideoEncoderKind,
+  encoder_fallback_chain, mark_hw_encoder_failed, VideoEncoderKind,
 };
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"];
@@ -744,6 +744,7 @@ pub async fn merge_videos(
             if encoder == VideoEncoderKind::X264 {
               break;
             }
+            mark_hw_encoder_failed();
           }
         }
       }

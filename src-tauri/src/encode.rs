@@ -1,14 +1,24 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// 返回 (crf, x264_preset, audio_bitrate)。
 /// 画质档位只影响码率与编码速度，绝不改分辨率。
 pub fn encode_params(quality_preset: &str) -> (&'static str, &'static str, &'static str) {
   match quality_preset {
-    "quality" => ("18", "medium", "192k"),
-    _ => ("23", "faster", "128k"),
+    // 画质优先：稍慢但更清晰
+    "quality" => ("18", "faster", "192k"),
+    // 体积优先：veryfast 明显提速，画质略降仍可接受
+    _ => ("23", "veryfast", "128k"),
   }
+}
+
+/// 硬编运行时失败后置位，避免每个文件都先撞一次硬编再回退。
+static HW_RUNTIME_DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_hw_encoder_failed() {
+  HW_RUNTIME_DISABLED.store(true, Ordering::SeqCst);
 }
 
 /// 视频编码策略：硬编优先，失败由调用方回退软编。
@@ -76,15 +86,23 @@ fn ffmpeg_lists_encoder(ffmpeg: &Path, name: &str) -> bool {
 
 /// 探测本机可用的硬编（进程内缓存一次）。
 pub fn preferred_hw_encoder(ffmpeg: &Path) -> Option<VideoEncoderKind> {
+  if HW_RUNTIME_DISABLED.load(Ordering::SeqCst) {
+    return None;
+  }
   static CACHED: OnceLock<Option<VideoEncoderKind>> = OnceLock::new();
-  *CACHED.get_or_init(|| {
+  let listed = *CACHED.get_or_init(|| {
     for kind in platform_hw_candidates() {
       if ffmpeg_lists_encoder(ffmpeg, kind.ffmpeg_name()) {
         return Some(*kind);
       }
     }
     None
-  })
+  });
+  if HW_RUNTIME_DISABLED.load(Ordering::SeqCst) {
+    None
+  } else {
+    listed
+  }
 }
 
 /// 编码尝试顺序：硬编（若有）→ libx264。
@@ -131,6 +149,12 @@ pub fn append_video_encode_args(
     }
     VideoEncoderKind::VideoToolbox => {
       let br = hw_bitrate_bps(width, height, quality_preset).to_string();
+      // prio_speed：体积优先全力抢速度；画质优先仍关 realtime，避免实时档伤画质
+      let prio_speed = if quality_preset == "quality" {
+        "0"
+      } else {
+        "1"
+      };
       cmd.args([
         "-c:v",
         "h264_videotoolbox",
@@ -138,21 +162,23 @@ pub fn append_video_encode_args(
         &br,
         "-realtime",
         "0",
+        "-prio_speed",
+        prio_speed,
         "-pix_fmt",
         "yuv420p",
       ]);
     }
     VideoEncoderKind::Nvenc => {
-      // cq 近似 CRF：体积优先偏大、画质优先偏小
-      let cq = match quality_preset {
-        "quality" => "19",
-        _ => "28",
+      // cq 近似 CRF：体积优先偏大、画质优先偏小；p1/p4 偏速度
+      let (cq, preset) = match quality_preset {
+        "quality" => ("19", "p4"),
+        _ => ("28", "p1"),
       };
       cmd.args([
         "-c:v",
         "h264_nvenc",
         "-preset",
-        "p4",
+        preset,
         "-rc",
         "vbr",
         "-cq",
@@ -200,9 +226,21 @@ pub fn append_video_encode_args(
   }
 }
 
+fn aac_encoder_name() -> &'static str {
+  // macOS AudioToolbox AAC 通常比原生 aac 软编更快
+  #[cfg(target_os = "macos")]
+  {
+    "aac_at"
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    "aac"
+  }
+}
+
 pub fn append_audio_aac_args(cmd: &mut Command, quality_preset: &str) {
   let (_, _, audio_bitrate) = encode_params(quality_preset);
-  cmd.args(["-c:a", "aac", "-b:a", audio_bitrate]);
+  cmd.args(["-c:a", aac_encoder_name(), "-b:a", audio_bitrate]);
 }
 
 /// 统一音频参数（合成时视频 copy、仅转音频）。
@@ -210,7 +248,7 @@ pub fn append_audio_aac_unified_args(cmd: &mut Command, quality_preset: &str) {
   let (_, _, audio_bitrate) = encode_params(quality_preset);
   cmd.args([
     "-c:a",
-    "aac",
+    aac_encoder_name(),
     "-b:a",
     audio_bitrate,
     "-ar",
