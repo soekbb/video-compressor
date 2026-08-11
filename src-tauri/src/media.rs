@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::compress::{
-  assert_resolution, probe_video_size, spawn_stderr_collector, CompressState,
+  assert_resolution, configure_subprocess, probe_video_size, spawn_stderr_collector, CompressState,
 };
 use crate::encode::{
   append_audio_aac_args, append_audio_aac_unified_args, append_video_encode_args,
@@ -84,7 +84,9 @@ fn ffprobe_entries(
   select: &str,
   entries: &str,
 ) -> Option<std::collections::HashMap<String, String>> {
-  let output = Command::new(ffprobe)
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
     .args([
       "-v",
       "error",
@@ -282,7 +284,9 @@ fn looks_runnable(path: &Path) -> bool {
   if !path.is_file() {
     return false;
   }
-  Command::new(path)
+  let mut command = Command::new(path);
+  configure_subprocess(&mut command);
+  command
     .arg("-version")
     .stdout(Stdio::null())
     .stderr(Stdio::null())
@@ -325,14 +329,17 @@ fn resolve_bin(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
   ] {
     let path = PathBuf::from(&candidate);
     if looks_runnable(&path)
-      || (!candidate.contains('/')
-        && Command::new(&candidate)
+      || (!candidate.contains('/') && {
+        let mut command = Command::new(&candidate);
+        configure_subprocess(&mut command);
+        command
           .arg("-version")
           .stdout(Stdio::null())
           .stderr(Stdio::null())
           .status()
           .map(|s| s.success())
-          .unwrap_or(false))
+          .unwrap_or(false)
+      })
     {
       return Ok(PathBuf::from(candidate));
     }
@@ -449,7 +456,9 @@ fn parse_out_time_secs(line: &str) -> Option<f64> {
 }
 
 fn probe_duration_secs(ffprobe: &Path, input: &Path) -> Option<f64> {
-  let output = Command::new(ffprobe)
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
     .args([
       "-v",
       "error",
@@ -561,6 +570,7 @@ pub async fn merge_videos(
 
     let run_once = |strategy: ConcatStrategy, encoder: VideoEncoderKind| -> Result<(), String> {
       let mut cmd = Command::new(&ffmpeg);
+      configure_subprocess(&mut cmd);
       cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
       let mut map_audio = true;
 

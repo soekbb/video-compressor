@@ -137,7 +137,7 @@ export async function initTaskStore() {
 export async function createTask(input: {
   type: TaskType
   title: string
-  meta?: Record<string, unknown>
+  meta?: TaskMeta
 }): Promise<string> {
   const id = makeId()
   const ts = nowIso()
@@ -216,9 +216,17 @@ export function cancelPendingTasksByType(type: TaskType, reason: string) {
   }
 }
 
+export type TaskFailure = {
+  inputPath: string
+  message: string
+}
+
 export type TaskMeta = {
   videoCount?: number
   doneCount?: number
+  completedCount?: number
+  skippedCount?: number
+  failures?: Array<TaskFailure>
   outputDir?: string
   outputPath?: string
   dramaPath?: string
@@ -234,6 +242,16 @@ export function parseTaskMeta(raw?: string): TaskMeta {
   } catch {
     return {}
   }
+}
+
+export function taskFailures(task: AppTask): TaskFailure[] {
+  if (task.status !== 'error') return []
+  const failures = parseTaskMeta(task.meta).failures
+  if (!Array.isArray(failures)) return []
+  return failures.filter(
+    (failure): failure is TaskFailure =>
+      typeof failure?.inputPath === 'string' && typeof failure.message === 'string',
+  )
 }
 
 function mergeMeta(current: AppTask | undefined, patch?: TaskMeta): string | undefined {
@@ -284,11 +302,11 @@ export function completeTask(id: string, meta?: TaskMeta) {
   unregisterAbortHandler(id)
 }
 
-export function failTask(id: string, error: string) {
+export function failTask(id: string, error: string, meta?: TaskMeta) {
   const current = tasks.value.find((t) => t.id === id)
   patchLocal(
     id,
-    { status: 'error', error, meta: mergeMeta(current, withDuration(current)) },
+    { status: 'error', error, meta: mergeMeta(current, withDuration(current, meta)) },
     true,
   )
   clearActive(id)

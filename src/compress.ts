@@ -17,6 +17,11 @@ export function getCompressConcurrency() {
   return getConcurrency()
 }
 
+export async function isCompressedOutputValid(path: string): Promise<boolean> {
+  if (!isTauri() || !path) return false
+  return invoke<boolean>('is_compressed_output_valid', { path })
+}
+
 /** 开始一批编码前清除该任务的取消标记 */
 export async function prepareCompressBatch(cancelKey: string) {
   if (!isTauri() || !cancelKey) return

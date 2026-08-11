@@ -3,6 +3,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+use crate::compress::configure_subprocess;
+
 /// 返回 (crf, x264_preset, audio_bitrate)。
 /// 画质档位只影响码率与编码速度，绝不改分辨率。
 pub fn encode_params(quality_preset: &str) -> (&'static str, &'static str, &'static str) {
@@ -67,7 +69,9 @@ fn platform_hw_candidates() -> &'static [VideoEncoderKind] {
 }
 
 fn ffmpeg_lists_encoder(ffmpeg: &Path, name: &str) -> bool {
-  let output = Command::new(ffmpeg)
+  let mut command = Command::new(ffmpeg);
+  configure_subprocess(&mut command);
+  let output = command
     .args(["-hide_banner", "-encoders"])
     .stdout(Stdio::piped())
     .stderr(Stdio::null())

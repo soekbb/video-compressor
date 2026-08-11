@@ -2,7 +2,12 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { computed, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
-import { getCompressConcurrency, compressVideo, prepareCompressBatch } from '../compress'
+import {
+  getCompressConcurrency,
+  compressVideo,
+  isCompressedOutputValid,
+  prepareCompressBatch,
+} from '../compress'
 import {
   isTauri,
   pickOutputDirectory,
@@ -12,6 +17,7 @@ import {
 } from '../desktop'
 import { mergeVideos, probeVideoDimensions } from '../merge'
 import { showConfirm, showDialog } from '../dialog'
+import { runManualBatchJob } from '../manualBatch'
 import { goToPage } from '../navigation'
 import { showToast } from '../toast'
 import { qualityPresetLabel, settings } from '../settings'
@@ -29,7 +35,14 @@ import {
   unregisterAbortHandler,
   updateTaskProgress,
 } from '../taskStore'
-import { formatSize, makeId, toBatchName, isVideoFileName } from '../utils'
+import {
+  assertUniqueOutputPaths,
+  formatSize,
+  isVideoFileName,
+  makeId,
+  toBatchName,
+  toOutputPath,
+} from '../utils'
 
 type WorkMode = 'batch' | 'merge'
 
@@ -254,12 +267,26 @@ async function pickOutputDir() {
 }
 
 async function startBatch() {
-  isBusy.value = true
-  const queue = items.value.map((item) => ({
-    ...item,
-    outputName: toBatchName(item.name),
-  }))
   const outputDir = outputPath.value
+  const queue = items.value.map((item) => ({
+    id: item.id,
+    inputPath: item.path,
+    outputDir,
+    outputName: toBatchName(item.name),
+    outputPath: toOutputPath(outputDir, toBatchName(item.name)),
+  }))
+  try {
+    assertUniqueOutputPaths(queue.map((item) => item.outputPath))
+  } catch (error) {
+    await showDialog({
+      title: '输出路径冲突',
+      tone: 'warn',
+      message: error instanceof Error ? error.message : String(error),
+    })
+    return
+  }
+
+  isBusy.value = true
   let aborted = false
   const willWait = hasRunningTask()
 
@@ -289,72 +316,32 @@ async function startBatch() {
     if (tasks.value.find((t) => t.id === taskId)?.status === 'cancelled' || aborted) return
 
     activeBatchTaskId.value = taskId
-    let cursor = 0
-    let doneCount = 0
-    let failCount = 0
-    const itemProgress = new Map<string, number>()
-
     try {
-      await prepareCompressBatch(taskId)
-
-      function refreshTaskProgress() {
-        if (aborted) return
-        const partial = [...itemProgress.values()].reduce((a, b) => a + b, 0)
-        const overall = ((doneCount + partial) / queue.length) * 100
-        updateTaskProgress(taskId, Math.min(99, overall), {
-          doneCount,
-          videoCount: queue.length,
-        })
+      function isCancelled() {
+        return aborted || tasks.value.find((task) => task.id === taskId)?.status === 'cancelled'
       }
 
-      async function worker() {
-        while (!aborted) {
-          const index = cursor
-          cursor += 1
-          if (index >= queue.length) break
-          const item = queue[index]
-          itemProgress.set(item.id, 0)
-          try {
-            await compressVideo({
-              id: item.id,
-              cancelKey: taskId,
-              inputPath: item.path,
-              outputDir,
-              outputName: item.outputName,
-              onProgress: (progress) => {
-                itemProgress.set(item.id, progress / 100)
-                refreshTaskProgress()
-              },
-            })
-            if (aborted) break
-            itemProgress.delete(item.id)
-            doneCount += 1
-            refreshTaskProgress()
-          } catch {
-            itemProgress.delete(item.id)
-            if (aborted) break
-            failCount += 1
-          }
-        }
-      }
-
-      const pool = Math.min(getCompressConcurrency(), queue.length)
-      await Promise.all(Array.from({ length: pool }, () => worker()))
-
-      const current = tasks.value.find((t) => t.id === taskId)
-      if (current?.status === 'cancelled') {
-        // already cancelled
-      } else if (aborted) {
-        cancelTaskLocal(taskId, '主动取消')
-      } else if (doneCount >= queue.length) {
-        completeTask(taskId, { outputDir, doneCount, videoCount: queue.length })
-      } else {
-        updateTaskProgress(taskId, Math.round((doneCount / Math.max(1, queue.length)) * 100), {
-          doneCount,
-          videoCount: queue.length,
-        })
-        failTask(taskId, failCount > 0 ? '部分文件压制失败' : '任务未完成')
-      }
+      await runManualBatchJob(queue, getCompressConcurrency(), {
+        prepareBatch: () => prepareCompressBatch(taskId),
+        isOutputValid: isCompressedOutputValid,
+        isCancelled,
+        compress: (item, onProgress) =>
+          compressVideo({
+            id: item.id,
+            cancelKey: taskId,
+            inputPath: item.inputPath,
+            outputDir: item.outputDir,
+            outputName: item.outputName,
+            onProgress,
+          }),
+        onProgress: (progress, counts) => updateTaskProgress(taskId, progress, counts),
+        onComplete: (meta) => completeTask(taskId, meta),
+        onFail: (message, meta) => failTask(taskId, message, meta),
+        onCancelled: () => {
+          const current = tasks.value.find((task) => task.id === taskId)
+          if (current?.status !== 'cancelled') cancelTaskLocal(taskId, '主动取消')
+        },
+      })
     } finally {
       unregisterAbortHandler(taskId)
       if (activeBatchTaskId.value === taskId) activeBatchTaskId.value = null

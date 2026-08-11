@@ -10,7 +10,13 @@ import {
   markDramaDone,
   setAutoWatchDir,
 } from '../autoStore'
-import { getCompressConcurrency, compressVideo, prepareCompressBatch } from '../compress'
+import { runAutoDramaJob, type AutoDramaQueueItem } from '../autoBatch'
+import {
+  getCompressConcurrency,
+  compressVideo,
+  isCompressedOutputValid,
+  prepareCompressBatch,
+} from '../compress'
 import { listDramaFolders } from '../drama'
 import { isTauri, pickOutputDirectory } from '../desktop'
 import { showDialog } from '../dialog'
@@ -31,7 +37,7 @@ import {
   updateTaskProgress,
 } from '../taskStore'
 import type { DramaFolder } from '../types'
-import { makeId, toBatchName } from '../utils'
+import { makeId, toBatchName, toOutputPath } from '../utils'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
 
@@ -204,22 +210,6 @@ function enqueuePending() {
   }
 }
 
-function updateDramaProgress(
-  jobPath: string,
-  doneCount: number,
-  total: number,
-  partial = 0,
-  taskId?: string,
-) {
-  const progress = Math.min(99, Math.round(((doneCount + partial) / total) * 100))
-  jobs.value = jobs.value.map((j) =>
-    j.path === jobPath ? { ...j, doneCount, progress } : j,
-  )
-  if (taskId) {
-    updateTaskProgress(taskId, progress, { doneCount, videoCount: total })
-  }
-}
-
 /** 创建自动压制任务并加入全局单任务队列（不立刻执行编码） */
 async function submitDrama(job: DramaJob) {
   const folder = folders.value.find((f) => f.path === job.path)
@@ -261,48 +251,44 @@ async function submitDrama(job: DramaJob) {
     }
 
     activeAutoTaskId.value = taskId
-    let doneCount = 0
-    let cursor = 0
-    const videoProgress = new Map<string, number>()
 
     try {
-      await prepareCompressBatch(taskId)
-
-      async function worker() {
-        while (!aborted) {
-          const index = cursor
-          cursor += 1
-          if (index >= folder!.videos.length) break
-          const video = folder!.videos[index]
-          const id = makeId()
-          videoProgress.set(id, 0)
-
-          await compressVideo({
-            id,
-            cancelKey: taskId,
-            inputPath: video.path,
-            outputDir,
-            outputName: toBatchName(video.name),
-            onProgress: (p) => {
-              videoProgress.set(id, p / 100)
-              const partial = [...videoProgress.values()].reduce((a, b) => a + b, 0)
-              updateDramaProgress(job.path, doneCount, total, partial, taskId)
-            },
-          })
-
-          if (aborted) break
-          videoProgress.delete(id)
-          doneCount += 1
-          updateDramaProgress(job.path, doneCount, total, 0, taskId)
+      const queue: AutoDramaQueueItem[] = folder.videos.map((video) => {
+        const outputName = toBatchName(video.name)
+        return {
+          id: makeId(),
+          inputPath: video.path,
+          outputDir,
+          outputName,
+          outputPath: toOutputPath(outputDir, outputName),
         }
-      }
-
-      const pool = Math.min(getCompressConcurrency(), Math.max(1, total))
-      await Promise.all(Array.from({ length: pool }, () => worker()))
+      })
+      const result = await runAutoDramaJob(queue, getCompressConcurrency(), {
+        prepareBatch: () => prepareCompressBatch(taskId),
+        isOutputValid: isCompressedOutputValid,
+        isCancelled: () => aborted || tasks.value.some((t) => t.id === taskId && t.status === 'cancelled'),
+        compress: (item, onProgress) =>
+          compressVideo({
+            id: item.id,
+            cancelKey: taskId,
+            inputPath: item.inputPath,
+            outputDir: item.outputDir,
+            outputName: item.outputName,
+            onProgress,
+          }),
+        onProgress: (progress, counts) => {
+          jobs.value = jobs.value.map((j) =>
+            j.path === job.path
+              ? { ...j, doneCount: counts.doneCount, progress: Math.round(progress) }
+              : j,
+          )
+          updateTaskProgress(taskId, progress, counts)
+        },
+      })
 
       const currentTask = tasks.value.find((t) => t.id === taskId)
       const cancelled = currentTask?.status === 'cancelled'
-      if (aborted || cancelled) {
+      if (result.status === 'cancelled' || aborted || cancelled) {
         const reason = currentTask?.error || '主动取消'
         if (!cancelled) cancelTaskLocal(taskId, reason)
         jobs.value = jobs.value.map((j) =>
@@ -310,9 +296,25 @@ async function submitDrama(job: DramaJob) {
         )
         return
       }
-      if (doneCount < total) throw new Error('剧目未全部完成')
+      if (result.status === 'failed') {
+        const failureCount = result.meta.failures.length
+        const failMessage = `${result.message}（${failureCount} 个文件）`
+        jobs.value = jobs.value.map((j) =>
+          j.path === job.path
+            ? {
+                ...j,
+                status: 'error',
+                progress: Math.min(99, j.progress),
+                doneCount: result.meta.doneCount,
+                error: failMessage,
+              }
+            : j,
+        )
+        failTask(taskId, failMessage, result.meta)
+        return
+      }
 
-      markDramaDone({
+      await markDramaDone({
         path: folder.path,
         name: folder.name,
         completedAt: new Date().toLocaleString(),
@@ -321,7 +323,7 @@ async function submitDrama(job: DramaJob) {
       jobs.value = jobs.value.map((j) =>
         j.path === job.path ? { ...j, status: 'done', progress: 100, doneCount: total } : j,
       )
-      completeTask(taskId, { outputDir, doneCount: total, videoCount: total })
+      completeTask(taskId, result.meta)
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       const current = tasks.value.find((t) => t.id === taskId)

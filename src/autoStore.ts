@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
-import { ref, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
+import { publishPersistedDramaDone } from './autoPersistence'
 import { isTauri } from './desktop'
 import type { AutoRecord } from './types'
 
@@ -42,18 +43,30 @@ function applyState(state: PersistState) {
   hydrating = false
 }
 
-export async function persistAutoStoreNow() {
+async function persistCanonicalAutoState(payload: PersistState) {
   if (!isTauri() || !autoStoreReady.value || hydrating) return
-  const payload: PersistState = {
-    watchDir: autoWatchDir.value,
-    enabled: autoEnabled.value,
-    done: autoDone.value,
-  }
   await invoke('save_auto_state', { state: payload })
+}
+
+function mirrorAutoState(payload: PersistState) {
   // 同步一份到 localStorage，便于网页调试
   localStorage.setItem(WATCH_KEY, payload.watchDir)
   localStorage.setItem(ENABLED_KEY, payload.enabled ? '1' : '0')
   localStorage.setItem(DONE_KEY, JSON.stringify(payload.done))
+}
+
+export async function persistAutoStoreNow() {
+  const payload = {
+    watchDir: autoWatchDir.value,
+    enabled: autoEnabled.value,
+    done: autoDone.value,
+  }
+  await persistCanonicalAutoState(payload)
+  try {
+    mirrorAutoState(payload)
+  } catch (err) {
+    console.error('同步自动压制调试记录失败', err)
+  }
 }
 
 function schedulePersist() {
@@ -125,9 +138,32 @@ export function isDramaDone(path: string) {
   return autoDone.value.some((r) => r.path === path)
 }
 
-export function markDramaDone(record: AutoRecord) {
-  if (isDramaDone(record.path)) return
-  autoDone.value = [record, ...autoDone.value]
+export async function markDramaDone(record: AutoRecord) {
+  await publishPersistedDramaDone(autoDone.value, record, {
+    persist: (done) =>
+      persistCanonicalAutoState({
+        watchDir: autoWatchDir.value,
+        enabled: autoEnabled.value,
+        done,
+      }),
+    mirror: (done) =>
+      mirrorAutoState({
+        watchDir: autoWatchDir.value,
+        enabled: autoEnabled.value,
+        done,
+      }),
+    onMirrorError: (err) => {
+      console.error('同步自动压制调试记录失败', err)
+    },
+    publish: (done) => {
+      autoDone.value = done
+    },
+  })
+  await nextTick()
+  if (persistTimer) {
+    window.clearTimeout(persistTimer)
+    persistTimer = undefined
+  }
 }
 
 export function clearAutoDone() {

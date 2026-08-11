@@ -11,6 +11,7 @@ import {
   removeTask,
   resolveDurationMs,
   statusLabel,
+  taskFailures,
   taskReason,
   tasks,
   typeLabel,
@@ -21,6 +22,7 @@ import {
 type StatusFilter = 'all' | 'active' | 'ended'
 
 const statusFilter = ref<StatusFilter>('all')
+const expandedFailureIds = ref(new Set<string>())
 
 const filters: { id: StatusFilter; label: string }[] = [
   { id: 'all', label: '全部' },
@@ -99,6 +101,21 @@ function footerText(task: AppTask) {
 function outputTarget(task: AppTask) {
   const meta = parseTaskMeta(task.meta)
   return String(meta.outputPath || meta.outputDir || '')
+}
+
+function isFailureExpanded(taskId: string) {
+  return expandedFailureIds.value.has(taskId)
+}
+
+function toggleFailureDetails(taskId: string) {
+  const next = new Set(expandedFailureIds.value)
+  if (next.has(taskId)) next.delete(taskId)
+  else next.add(taskId)
+  expandedFailureIds.value = next
+}
+
+function failureFilename(inputPath: string) {
+  return inputPath.split(/[\\/]/).filter(Boolean).at(-1) || inputPath
 }
 
 async function onCancel(task: AppTask) {
@@ -214,6 +231,20 @@ async function onReveal(task: AppTask) {
               >
                 {{ task.status === 'error' ? '失败原因' : '取消原因' }}：{{ taskReason(task) }}
               </p>
+              <button
+                v-if="taskFailures(task).length"
+                type="button"
+                class="failure-toggle"
+                :aria-expanded="isFailureExpanded(task.id)"
+                :aria-controls="`task-failures-${task.id}`"
+                @click="toggleFailureDetails(task.id)"
+              >
+                {{
+                  isFailureExpanded(task.id)
+                    ? '收起错误详情'
+                    : `查看错误详情（${taskFailures(task).length}）`
+                }}
+              </button>
             </div>
             <div class="file-actions">
               <span class="status" :class="`status-${task.status}`">
@@ -243,6 +274,25 @@ async function onReveal(task: AppTask) {
               >
                 删除
               </button>
+            </div>
+
+            <div
+              v-if="taskFailures(task).length && isFailureExpanded(task.id)"
+              :id="`task-failures-${task.id}`"
+              class="failure-details"
+            >
+              <p class="failure-details-title">失败文件与最终 FFmpeg 错误</p>
+              <ul class="failure-list">
+                <li
+                  v-for="(failure, index) in taskFailures(task)"
+                  :key="`${failure.inputPath}-${index}`"
+                  class="failure-item"
+                >
+                  <p class="failure-name">{{ failureFilename(failure.inputPath) }}</p>
+                  <p class="failure-path">{{ failure.inputPath }}</p>
+                  <pre class="failure-message">{{ failure.message }}</pre>
+                </li>
+              </ul>
             </div>
 
             <div
@@ -351,6 +401,84 @@ async function onReveal(task: AppTask) {
 
 .task-reason.is-cancelled {
   color: var(--text-muted);
+}
+
+.failure-toggle {
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.failure-toggle:hover {
+  text-decoration: underline;
+}
+
+.failure-details {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(248, 113, 113, 0.22);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.06);
+}
+
+.failure-details-title {
+  margin: 0 0 8px;
+  color: var(--danger);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.failure-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.failure-item {
+  min-width: 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(8, 16, 15, 0.42);
+}
+
+.failure-name,
+.failure-path,
+.failure-message {
+  margin: 0;
+}
+
+.failure-name {
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.failure-path {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.failure-message {
+  margin-top: 6px;
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .task-foot {

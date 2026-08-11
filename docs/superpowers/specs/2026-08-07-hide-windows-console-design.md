@@ -22,4 +22,4 @@ Windows 桌面版执行压缩、合成、媒体探测和 FFmpeg/FFprobe 可执�
 
 ## 验证
 
-添加 Rust 单元测试，确认辅助函数可作用于一个最小 `Command` 并正常启动。执行 Rust 测试和格式检查；在 Windows 打包应用中分别执行压缩、合成和媒体扫描，确认无控制台窗口弹出且任务可完成。
+Add a Windows-only compilation test for the subprocess configuration helper. Run Rust formatting and tests; on a Windows build, run a compression, a merge, and a media scan to confirm no console window appears and all tasks finish normally.

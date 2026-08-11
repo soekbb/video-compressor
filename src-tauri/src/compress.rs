@@ -8,6 +8,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// Suppress console windows for console subprocesses launched by the Windows GUI app.
+pub fn configure_subprocess(command: &mut Command) {
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+  }
+
+  #[cfg(not(windows))]
+  let _ = command;
+}
+
 /// 后台持续排空 stderr，避免管道写满导致 FFmpeg 阻塞卡死。
 pub fn spawn_stderr_collector(stderr: impl Read + Send + 'static) -> JoinHandle<String> {
   std::thread::spawn(move || {
@@ -84,7 +98,9 @@ impl CompressState {
 
 /// 读取视频流宽高（coded width/height）。
 pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), String> {
-  let output = Command::new(ffprobe)
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
     .args([
       "-v",
       "error",
@@ -145,6 +161,27 @@ pub fn assert_resolution(
   Ok(())
 }
 
+fn is_compressed_output_valid_with_probe(ffprobe: &Path, path: &Path) -> bool {
+  let is_non_empty_file = fs::metadata(path)
+    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+    .unwrap_or(false);
+  is_non_empty_file && probe_video_size(ffprobe, path).is_ok()
+}
+
+#[tauri::command]
+pub async fn is_compressed_output_valid(app: AppHandle, path: String) -> bool {
+  let Ok(ffprobe) = resolve_bin(&app, "ffprobe") else {
+    return false;
+  };
+  let output = PathBuf::from(path);
+
+  tauri::async_runtime::spawn_blocking(move || {
+    is_compressed_output_valid_with_probe(&ffprobe, &output)
+  })
+  .await
+  .unwrap_or(false)
+}
+
 impl Default for CompressState {
   fn default() -> Self {
     Self {
@@ -157,7 +194,9 @@ fn looks_runnable(path: &Path) -> bool {
   if !path.is_file() {
     return false;
   }
-  Command::new(path)
+  let mut command = Command::new(path);
+  configure_subprocess(&mut command);
+  command
     .arg("-version")
     .stdout(Stdio::null())
     .stderr(Stdio::null())
@@ -207,16 +246,19 @@ fn resolve_bin(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
       return Ok(path);
     }
     // PATH 中的命令名
-    if !candidate.contains('/')
-      && Command::new(&candidate)
+    if !candidate.contains('/') {
+      let mut command = Command::new(&candidate);
+      configure_subprocess(&mut command);
+      if command
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-    {
-      return Ok(PathBuf::from(candidate));
+      {
+        return Ok(PathBuf::from(candidate));
+      }
     }
   }
 
@@ -247,7 +289,9 @@ pub fn cleanup_orphan_ffmpeg(app: &AppHandle) {
 }
 
 fn probe_duration_secs(ffprobe: &Path, input: &Path) -> Option<f64> {
-  let output = Command::new(ffprobe)
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
     .args([
       "-v",
       "error",
@@ -381,6 +425,7 @@ pub async fn compress_video(
       }
 
       let mut cmd = Command::new(&ffmpeg);
+      configure_subprocess(&mut cmd);
       cmd.args([
         "-y",
         "-hide_banner",
@@ -526,4 +571,81 @@ pub fn prepare_compress_batch(state: State<'_, Arc<CompressState>>, cancel_key: 
 #[tauri::command]
 pub fn cancel_compress(state: State<'_, Arc<CompressState>>, cancel_key: String) {
   state.request_cancel(&cancel_key);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+
+  #[cfg(unix)]
+  use std::os::unix::fs::PermissionsExt;
+  #[cfg(windows)]
+  use std::process::Command;
+
+  const MINIMAL_Y4M_VIDEO: &[u8] =
+    b"YUV4MPEG2 W2 H2 F1:1 Ip A1:1 C420jpeg\nFRAME\n\x10\x10\x10\x10\x80\x80";
+
+  #[cfg(unix)]
+  fn fake_ffprobe(stdout: &str, succeeds: bool) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+      "video-compressor-output-validation-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let ffprobe = dir.join("ffprobe");
+    fs::write(
+      &ffprobe,
+      format!(
+        "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {}\n",
+        stdout,
+        if succeeds { 0 } else { 1 }
+      ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&ffprobe).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ffprobe, permissions).unwrap();
+    (dir, ffprobe)
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn validates_only_non_empty_outputs_with_readable_video_streams() {
+    let (dir, ffprobe) = fake_ffprobe("1920x1080", true);
+    let output = dir.join("output.mp4");
+
+    assert!(!is_compressed_output_valid_with_probe(&ffprobe, &output));
+
+    fs::write(&output, []).unwrap();
+    assert!(!is_compressed_output_valid_with_probe(&ffprobe, &output));
+
+    fs::write(&output, MINIMAL_Y4M_VIDEO).unwrap();
+    assert!(is_compressed_output_valid_with_probe(&ffprobe, &output));
+
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn rejects_non_empty_outputs_when_ffprobe_cannot_read_a_video_stream() {
+    let (dir, ffprobe) = fake_ffprobe("", false);
+    let output = dir.join("output.mp4");
+    fs::write(&output, [1]).unwrap();
+
+    assert!(!is_compressed_output_valid_with_probe(&ffprobe, &output));
+
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn configures_a_windows_subprocess() {
+    let mut command = Command::new("cmd");
+    configure_subprocess(&mut command);
+  }
 }
