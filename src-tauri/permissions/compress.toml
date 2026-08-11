@@ -4,6 +4,11 @@ description = "允许调用 compress_video 进行视频压缩"
 commands.allow = ["compress_video"]
 
 [[permission]]
+identifier = "allow-is-compressed-output-valid"
+description = "允许调用 is_compressed_output_valid 校验已压制输出"
+commands.allow = ["is_compressed_output_valid"]
+
+[[permission]]
 identifier = "allow-prepare-compress-batch"
 description = "允许调用 prepare_compress_batch 开始一批压缩"
 commands.allow = ["prepare_compress_batch"]
@@ -17,6 +22,11 @@ commands.allow = ["cancel_compress"]
 identifier = "allow-merge-videos"
 description = "允许调用 merge_videos 合成视频"
 commands.allow = ["merge_videos"]
+
+[[permission]]
+identifier = "allow-probe-video-dimensions"
+description = "允许调用 probe_video_dimensions 读取视频分辨率"
+commands.allow = ["probe_video_dimensions"]
 
 [[permission]]
 identifier = "allow-list-drama-folders"
