@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@11.7.0",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
@@ -11,7 +12,7 @@
     "prepare:ffmpeg": "node scripts/prepare-ffmpeg.mjs",
     "tauri": "tauri",
     "tauri:dev": "node scripts/ensure-ffmpeg.mjs && tauri dev",
-    "tauri:build": "npm run prepare:ffmpeg && tauri build"
+    "tauri:build": "node scripts/prepare-ffmpeg.mjs && tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

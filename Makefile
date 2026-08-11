@@ -9,6 +9,7 @@ SHELL := /bin/bash
 
 UNAME_S := $(shell uname -s)
 CARGO_ENV := $(HOME)/.cargo/env
+comma := ,
 
 # 确保 release 产物落在项目内，而不是外部缓存目录
 export CARGO_TARGET_DIR := $(CURDIR)/src-tauri/target
@@ -35,18 +36,18 @@ help:
 	@echo ""
 
 install:
-	npm install
+	pnpm install
 
 prepare-ffmpeg:
-	npm run prepare:ffmpeg
+	pnpm run prepare:ffmpeg
 
 # 桌面调试：原生窗口 + 热更新
 dev:
-	$(call with_cargo,npm run tauri:dev)
+	$(call with_cargo,pnpm run tauri:dev)
 
 # 仅前端网页调试
 web:
-	npm run dev -- --host 127.0.0.1 --port 5188
+	pnpm run dev -- --host 127.0.0.1 --port 5188
 
 # 按当前操作系统打包
 build:
@@ -56,14 +57,14 @@ else ifeq ($(OS),Windows_NT)
 	@$(MAKE) build-win
 else
 	@echo "当前系统未单独配置目标，改为打全量 bundle…"
-	$(call with_cargo,npm run prepare:ffmpeg && npx tauri build)
+	$(call with_cargo,pnpm run prepare:ffmpeg && pnpm exec tauri build)
 endif
 
 # macOS：dmg + app
 build-mac:
 ifeq ($(UNAME_S),Darwin)
 	@echo "→ 打包 macOS（含内置 FFmpeg）…"
-	$(call with_cargo,npm run prepare:ffmpeg && npx tauri build --bundles dmg,app)
+	$(call with_cargo,pnpm run prepare:ffmpeg && pnpm exec tauri build --bundles dmg$(comma)app)
 	@echo ""
 	@echo "产物目录：src-tauri/target/release/bundle/"
 	@ls -la src-tauri/target/release/bundle/dmg 2>/dev/null || true
@@ -78,14 +79,14 @@ endif
 build-win:
 ifeq ($(OS),Windows_NT)
 	@echo "→ 打包 Windows（含内置 FFmpeg）…"
-	npm run prepare:ffmpeg
-	npx tauri build --bundles nsis
+	pnpm run prepare:ffmpeg
+	pnpm exec tauri build --bundles nsis
 	@echo ""
 	@echo "产物目录：src-tauri/target/release/bundle/nsis/"
 else
 	@echo "错误：build-win 请在 Windows 上执行。"
 	@echo "在 Mac 上请用：make build-mac"
-	@echo "把项目拷到 Windows 后执行：make build-win 或 npm run tauri:build"
+	@echo "把项目拷到 Windows 后执行：make build-win 或 pnpm run tauri:build"
 	@exit 1
 endif
 
