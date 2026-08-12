@@ -1,22 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { seedVideoNames, videosToProcess } from '../autoScan'
 import {
+  appendDramaVideoSuccess,
   autoDone,
   autoEnabled,
   autoWatchDir,
   clearAutoDone,
   initAutoStore,
-  isDramaDone,
-  markDramaDone,
+  recordDramaVideoFailure,
+  seedDramaVideoNames,
   setAutoWatchDir,
 } from '../autoStore'
 import { runAutoDramaJob, type AutoDramaQueueItem } from '../autoBatch'
-import {
-  getCompressConcurrency,
-  compressVideo,
-  isCompressedOutputValid,
-  prepareCompressBatch,
-} from '../compress'
+import { getCompressConcurrency, compressVideo, prepareCompressBatch } from '../compress'
 import { listDramaFolders } from '../drama'
 import { isTauri, pickOutputDirectory } from '../desktop'
 import { showDialog } from '../dialog'
@@ -37,7 +34,7 @@ import {
   updateTaskProgress,
 } from '../taskStore'
 import type { DramaFolder } from '../types'
-import { makeId, toBatchName, toOutputPath } from '../utils'
+import { makeId, toOutputPath } from '../utils'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
 
@@ -45,6 +42,7 @@ type DramaJob = {
   path: string
   name: string
   videoCount: number
+  videos: DramaFolder['videos']
   status: JobStatus
   progress: number
   doneCount: number
@@ -64,23 +62,46 @@ const manualBurst = ref(false)
 let timer: number | undefined
 let countdownTimer: number | undefined
 
-/** 已完成记录 / 排队中 / 进行中 / 任务列表里已完成或进行中的自动任务，扫描时跳过 */
-function shouldSkipDrama(path: string) {
-  if (isDramaDone(path)) return true
+function recordFor(path: string) {
+  return autoDone.value.find((r) => r.path === path)
+}
 
+function videosForFolder(folder: DramaFolder) {
+  return videosToProcess(folder, recordFor(folder.path))
+}
+
+function isBusyLocallyOrInTasks(path: string) {
   const local = jobs.value.find((j) => j.path === path)
-  if (local && (local.status === 'queued' || local.status === 'running' || local.status === 'done')) {
+  if (local && (local.status === 'queued' || local.status === 'running')) {
     return true
   }
 
   return tasks.value.some((t) => {
     if (t.type !== 'auto') return false
     if (parseTaskMeta(t.meta).dramaPath !== path) return false
-    return t.status === 'pending' || t.status === 'running' || t.status === 'done'
+    return t.status === 'pending' || t.status === 'running'
   })
 }
 
+/** 已排队/进行中，或无可压视频（含超龄）时跳过；缺 videoNames 的种子轮不跳过 */
+function shouldSkipDrama(path: string) {
+  const folder = folders.value.find((f) => f.path === path)
+  if (!folder) return true
+  if (isBusyLocallyOrInTasks(path)) return true
+  const pending = videosForFolder(folder)
+  if (pending === null) return false
+  return pending.length === 0
+}
+
 const pendingFolders = computed(() => folders.value.filter((f) => !shouldSkipDrama(f.path)))
+
+const compressPendingFolders = computed(() =>
+  folders.value.filter((f) => {
+    if (isBusyLocallyOrInTasks(f.path)) return false
+    const pending = videosForFolder(f)
+    return pending !== null && pending.length > 0
+  }),
+)
 
 const queueJobs = computed(() =>
   jobs.value.filter((j) => j.status === 'queued' || j.status === 'running' || j.status === 'error'),
@@ -137,28 +158,33 @@ async function scanNow(options?: { notify?: boolean }) {
   try {
     folders.value = await listDramaFolders(autoWatchDir.value)
     lastScanAt.value = new Date().toLocaleTimeString()
-    const pending = folders.value.filter((f) => !shouldSkipDrama(f.path))
+    // 入队前统计待压剧目（入队后会标为 busy，不能再靠 compressPendingFolders）
+    const compressPending = compressPendingFolders.value.map((f) => ({
+      name: f.name,
+      pendingCount: videosForFolder(f)?.length ?? 0,
+    }))
     // 仅「自动扫描已开启」或「立即扫描」才入队并处理
     const shouldProcess = autoEnabled.value || Boolean(options?.notify)
     if (shouldProcess) {
-      enqueuePending()
-      if (pending.length > 0) {
+      await enqueuePending()
+      if (compressPending.length > 0 || jobs.value.some((j) => j.status === 'queued')) {
         if (options?.notify) manualBurst.value = true
         if (!isWorking.value) void processQueue()
       }
     }
     if (options?.notify) {
-      if (pending.length > 0) {
-        const preview = pending.slice(0, 6)
+      const notifyCount = compressPending.length
+      if (notifyCount > 0) {
+        const preview = compressPending.slice(0, 6)
         await showDialog({
           title: '扫描完成',
           tone: 'ok',
-          message: `发现 ${pending.length} 个待处理剧目，已开始压制`,
+          message: `发现 ${notifyCount} 个待处理剧目，已开始压制`,
           items: preview.map((f) => ({
             title: f.name,
-            meta: `${f.videoCount} 个视频`,
+            meta: `${f.pendingCount} 个视频`,
           })),
-          itemsMore: Math.max(0, pending.length - preview.length),
+          itemsMore: Math.max(0, notifyCount - preview.length),
         })
       } else if (folders.value.length > 0) {
         await showDialog({
@@ -189,11 +215,24 @@ async function scanNow(options?: { notify?: boolean }) {
   }
 }
 
-function enqueuePending() {
+async function enqueuePending() {
+  const at = new Date().toLocaleString()
   for (const folder of pendingFolders.value) {
     if (shouldSkipDrama(folder.path)) continue
+    const pending = videosForFolder(folder)
+    if (pending === null) {
+      await seedDramaVideoNames({
+        path: folder.path,
+        name: folder.name,
+        videoNames: seedVideoNames(folder),
+        at,
+      })
+      continue
+    }
+    if (pending.length === 0) continue
+
     const existing = jobs.value.find((j) => j.path === folder.path)
-    if (existing && (existing.status === 'queued' || existing.status === 'running' || existing.status === 'done')) {
+    if (existing && (existing.status === 'queued' || existing.status === 'running')) {
       continue
     }
     jobs.value = [
@@ -201,7 +240,8 @@ function enqueuePending() {
       {
         path: folder.path,
         name: folder.name,
-        videoCount: folder.videoCount,
+        videoCount: pending.length,
+        videos: pending,
         status: 'queued',
         progress: 0,
         doneCount: 0,
@@ -230,15 +270,15 @@ async function submitDrama(job: DramaJob) {
   const taskId = await createTask({
     type: 'auto',
     title: folder.name,
-    meta: { dramaPath: folder.path, videoCount: folder.videoCount },
+    meta: { dramaPath: folder.path, videoCount: job.videoCount },
   })
   registerAbortHandler(taskId, () => {
     aborted = true
   })
 
-  const sep = autoWatchDir.value.includes('\\') ? '\\' : '/'
-  const outputDir = `${autoWatchDir.value}${sep}影工输出${sep}${folder.name}`
-  const total = folder.videos.length
+  const outputDir = folder.path
+  const videos = job.videos
+  const total = videos.length
 
   enqueueTaskRun(taskId, async () => {
     if (tasks.value.find((t) => t.id === taskId)?.status === 'cancelled' || aborted) {
@@ -253,8 +293,8 @@ async function submitDrama(job: DramaJob) {
     activeAutoTaskId.value = taskId
 
     try {
-      const queue: AutoDramaQueueItem[] = folder.videos.map((video) => {
-        const outputName = toBatchName(video.name)
+      const queue: AutoDramaQueueItem[] = videos.map((video) => {
+        const outputName = video.name
         return {
           id: makeId(),
           inputPath: video.path,
@@ -265,7 +305,8 @@ async function submitDrama(job: DramaJob) {
       })
       const result = await runAutoDramaJob(queue, getCompressConcurrency(), {
         prepareBatch: () => prepareCompressBatch(taskId),
-        isOutputValid: isCompressedOutputValid,
+        // 原位替换：源文件本身不能用 ffprobe「已有有效输出」跳过
+        isOutputValid: async () => false,
         isCancelled: () => aborted || tasks.value.some((t) => t.id === taskId && t.status === 'cancelled'),
         compress: (item, onProgress) =>
           compressVideo({
@@ -296,6 +337,31 @@ async function submitDrama(job: DramaJob) {
         )
         return
       }
+
+      const at = new Date().toLocaleString()
+      const failedByPath = new Map(
+        result.meta.failures.map((f) => [f.inputPath, f.message] as const),
+      )
+      for (const item of queue) {
+        const failMessage = failedByPath.get(item.inputPath)
+        if (failMessage !== undefined) {
+          await recordDramaVideoFailure({
+            path: folder.path,
+            name: folder.name,
+            videoName: item.outputName,
+            reason: failMessage,
+            at,
+          })
+        } else {
+          await appendDramaVideoSuccess({
+            path: folder.path,
+            name: folder.name,
+            videoName: item.outputName,
+            at,
+          })
+        }
+      }
+
       if (result.status === 'failed') {
         const failureCount = result.meta.failures.length
         const failMessage = `${result.message}（${failureCount} 个文件）`
@@ -314,12 +380,6 @@ async function submitDrama(job: DramaJob) {
         return
       }
 
-      await markDramaDone({
-        path: folder.path,
-        name: folder.name,
-        completedAt: new Date().toLocaleString(),
-        videoCount: folder.videoCount,
-      })
       jobs.value = jobs.value.map((j) =>
         j.path === job.path ? { ...j, status: 'done', progress: 100, doneCount: total } : j,
       )
@@ -489,8 +549,8 @@ onBeforeUnmount(() => {
         </div>
         <div class="action-row">
           <p class="hint">
-            每个子文件夹视为一个剧目。监控目录会自动保存。输出到
-            <code>监控目录/影工输出/剧目名/</code>，并记录已完成，避免重复压制。
+            每个子文件夹视为一个剧目。压制成功后原位替换同名文件；已记录剧目在目录创建 2
+            天内会增量压制新增视频。
           </p>
           <button
             type="button"
@@ -503,7 +563,7 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <p class="summary">
-          待处理 {{ pendingFolders.length }} 个剧目 · 已完成记录 {{ autoDone.length }}
+          待处理 {{ compressPendingFolders.length }} 个剧目 · 已完成记录 {{ autoDone.length }}
           <template v-if="lastScanAt"> · 上次扫描 {{ lastScanAt }}</template>
           <template v-if="autoEnabled"> · 下次扫描 {{ formatCountdown(nextScanIn) }}</template>
         </p>
@@ -523,6 +583,21 @@ onBeforeUnmount(() => {
             清空已完成记录
           </button>
         </div>
+        <ul v-if="autoDone.length" class="file-list done-list">
+          <li v-for="r in autoDone" :key="r.path" class="file-item">
+            <div class="file-meta">
+              <p class="file-name">{{ r.name }}</p>
+              <p class="file-sub">已成功 {{ r.videoNames?.length ?? r.videoCount }} 个</p>
+              <details v-if="(r.videoNames?.length || r.failures?.length)">
+                <summary>明细</summary>
+                <p v-for="n in r.videoNames || []" :key="n">{{ n }}</p>
+                <p v-for="f in r.failures || []" :key="f.name + f.at" class="err">
+                  {{ f.name }}：{{ f.reason }}
+                </p>
+              </details>
+            </div>
+          </li>
+        </ul>
         <p v-if="scanError" class="summary err">{{ scanError }}</p>
       </div>
 
@@ -585,5 +660,20 @@ onBeforeUnmount(() => {
 
 .auto-queue {
   max-height: 320px;
+}
+
+.done-list {
+  margin-top: 0.75rem;
+  max-height: 220px;
+}
+
+.done-list details {
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--muted, inherit);
+}
+
+.done-list details p {
+  margin: 0.15rem 0;
 }
 </style>

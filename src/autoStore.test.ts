@@ -179,7 +179,14 @@ test('debug mirror failure does not reject or suppress a persisted completion', 
 })
 
 test('upsert merges videoNames and clears matching failures', async () => {
-  const existing = [
+  const existing: Array<{
+    path: string
+    name: string
+    completedAt: string
+    videoCount: number
+    videoNames?: string[]
+    failures?: { name: string; reason: string; at: string }[]
+  }> = [
     {
       path: '/d/a',
       name: 'A',

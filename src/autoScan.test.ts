@@ -6,6 +6,7 @@ import {
   isDramaFolderFresh,
   pendingVideosForDrama,
   seedVideoNames,
+  videosToProcess,
 } from './autoScan.ts'
 
 test('folder newer than 2 days is fresh', () => {
@@ -43,4 +44,49 @@ test('seedVideoNames lists all current names', () => {
     'x.mp4',
     'y.mp4',
   ])
+})
+
+test('videosToProcess: new drama returns all videos', () => {
+  const now = 1_700_000_000_000
+  const folder = {
+    createdAtMs: now - TWO_DAYS_MS * 10,
+    videos: [{ name: 'a.mp4' }, { name: 'b.mp4' }],
+  }
+  assert.deepEqual(
+    videosToProcess(folder, null, now)?.map((v) => v.name),
+    ['a.mp4', 'b.mp4'],
+  )
+})
+
+test('videosToProcess: missing videoNames signals seed-only', () => {
+  const now = 1_700_000_000_000
+  const folder = {
+    createdAtMs: now - 1000,
+    videos: [{ name: 'a.mp4' }],
+  }
+  assert.equal(videosToProcess(folder, { videoNames: undefined }, now), null)
+})
+
+test('videosToProcess: old drama beyond 2 days returns empty', () => {
+  const now = 1_700_000_000_000
+  const folder = {
+    createdAtMs: now - TWO_DAYS_MS - 1,
+    videos: [{ name: 'a.mp4' }, { name: 'new.mp4' }],
+  }
+  assert.deepEqual(
+    videosToProcess(folder, { videoNames: ['a.mp4'] }, now),
+    [],
+  )
+})
+
+test('videosToProcess: old drama within 2 days returns pending only', () => {
+  const now = 1_700_000_000_000
+  const folder = {
+    createdAtMs: now - TWO_DAYS_MS + 1,
+    videos: [{ name: 'a.mp4' }, { name: 'new.mp4' }],
+  }
+  assert.deepEqual(
+    videosToProcess(folder, { videoNames: ['a.mp4'] }, now)?.map((v) => v.name),
+    ['new.mp4'],
+  )
 })
