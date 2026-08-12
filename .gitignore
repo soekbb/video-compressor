@@ -35,3 +35,4 @@ src-tauri/icons/android
 *.njsproj
 *.sln
 *.sw?
+.worktrees/
