@@ -387,6 +387,12 @@ pub async fn compress_video(
   }
 
   let output_path = output_dir_path.join(&output_name);
+  let inplace = output_path == input;
+  let encode_path = if inplace {
+    crate::replace::temp_output_path(&output_path)
+  } else {
+    output_path.clone()
+  };
   let ffmpeg = resolve_bin(&app, "ffmpeg")?;
   let ffprobe = resolve_bin(&app, "ffprobe")?;
   let input_wh = probe_video_size(&ffprobe, &input)?;
@@ -396,7 +402,8 @@ pub async fn compress_video(
 
   let app_for_progress = app.clone();
   let id_for_progress = id.clone();
-  let output_path_clone = output_path.clone();
+  let encode_path_clone = encode_path.clone();
+  let final_path_clone = output_path.clone();
   let ffprobe_for_check = ffprobe.clone();
   let preset = quality_preset.unwrap_or_else(|| "size".into());
 
@@ -405,16 +412,18 @@ pub async fn compress_video(
       append_audio_aac_args, append_video_encode_args, encoder_fallback_chain,
       mark_hw_encoder_failed, VideoEncoderKind,
     };
+    use crate::replace::replace_file_force;
 
     let encoders = encoder_fallback_chain(&ffmpeg);
     let mut last_err = String::from("压缩失败");
 
     for (attempt, encoder) in encoders.into_iter().enumerate() {
       if cancel.is_cancelled(&cancel_key) {
+        let _ = fs::remove_file(&encode_path_clone);
         return Err("已取消压缩".into());
       }
       if attempt > 0 {
-        let _ = fs::remove_file(&output_path_clone);
+        let _ = fs::remove_file(&encode_path_clone);
         let _ = app_for_progress.emit(
           "compress-progress",
           CompressProgressPayload {
@@ -443,7 +452,7 @@ pub async fn compress_video(
         "-progress",
         "pipe:1",
         "-nostats",
-        output_path_clone.to_string_lossy().as_ref(),
+        encode_path_clone.to_string_lossy().as_ref(),
       ]);
 
       let mut child = cmd
@@ -469,7 +478,7 @@ pub async fn compress_video(
         if cancel.is_cancelled(&cancel_key) {
           let _ = child.kill();
           let _ = stderr_worker.join();
-          let _ = fs::remove_file(&output_path_clone);
+          let _ = fs::remove_file(&encode_path_clone);
           return Err("已取消压缩".into());
         }
 
@@ -507,14 +516,14 @@ pub async fn compress_video(
       let err_buf = stderr_worker.join().unwrap_or_default();
 
       if cancel.is_cancelled(&cancel_key) {
-        let _ = fs::remove_file(&output_path_clone);
+        let _ = fs::remove_file(&encode_path_clone);
         return Err("已取消压缩".into());
       }
 
-      if status.success() && output_path_clone.is_file() {
-        if let Err(e) = assert_resolution(&ffprobe_for_check, &output_path_clone, input_wh) {
+      if status.success() && encode_path_clone.is_file() {
+        if let Err(e) = assert_resolution(&ffprobe_for_check, &encode_path_clone, input_wh) {
           last_err = e;
-          let _ = fs::remove_file(&output_path_clone);
+          let _ = fs::remove_file(&encode_path_clone);
           // 硬编分辨率异常时继续回退；软编失败则直接返回
           if encoder == VideoEncoderKind::X264 {
             return Err(last_err);
@@ -522,7 +531,11 @@ pub async fn compress_video(
           continue;
         }
 
-        let output_size = fs::metadata(&output_path_clone)
+        if inplace {
+          replace_file_force(&encode_path_clone, &final_path_clone)?;
+        }
+
+        let output_size = fs::metadata(&final_path_clone)
           .map(|m| m.len())
           .unwrap_or(0);
 
@@ -535,7 +548,7 @@ pub async fn compress_video(
         );
 
         return Ok(CompressResult {
-          output_path: output_path_clone.to_string_lossy().to_string(),
+          output_path: final_path_clone.to_string_lossy().to_string(),
           output_size,
         });
       }
@@ -546,7 +559,7 @@ pub async fn compress_video(
         .find(|l| !l.trim().is_empty())
         .unwrap_or("FFmpeg 压缩失败");
       last_err = format!("压缩失败（{}）：{detail}", encoder.ffmpeg_name());
-      let _ = fs::remove_file(&output_path_clone);
+      let _ = fs::remove_file(&encode_path_clone);
 
       if encoder == VideoEncoderKind::X264 {
         break;
@@ -555,6 +568,7 @@ pub async fn compress_video(
       mark_hw_encoder_failed();
     }
 
+    let _ = fs::remove_file(&encode_path_clone);
     Err(last_err)
   })
   .await

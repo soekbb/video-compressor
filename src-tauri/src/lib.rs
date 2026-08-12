@@ -2,6 +2,7 @@ mod compress;
 mod encode;
 mod media;
 mod persist;
+mod replace;
 mod reveal;
 mod sysinfo;
 mod tasks;
