@@ -5,11 +5,23 @@ use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct AutoVideoFailure {
+  pub name: String,
+  pub reason: String,
+  pub at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AutoRecord {
   pub path: String,
   pub name: String,
   pub completed_at: String,
   pub video_count: usize,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub video_names: Option<Vec<String>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub failures: Option<Vec<AutoVideoFailure>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

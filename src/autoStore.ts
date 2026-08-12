@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { nextTick, ref, watch } from 'vue'
-import { publishPersistedDramaDone } from './autoPersistence'
+import { publishPersistedDramaDone, publishUpsertDramaRecord } from './autoPersistence'
 import { isTauri } from './desktop'
 import type { AutoRecord } from './types'
 
@@ -164,6 +164,95 @@ export async function markDramaDone(record: AutoRecord) {
     window.clearTimeout(persistTimer)
     persistTimer = undefined
   }
+}
+
+export async function upsertAutoRecord(record: AutoRecord) {
+  await publishUpsertDramaRecord(autoDone.value, record, {
+    persist: (done) =>
+      persistCanonicalAutoState({
+        watchDir: autoWatchDir.value,
+        enabled: autoEnabled.value,
+        done,
+      }),
+    mirror: (done) =>
+      mirrorAutoState({
+        watchDir: autoWatchDir.value,
+        enabled: autoEnabled.value,
+        done,
+      }),
+    onMirrorError: (err) => {
+      console.error('同步自动压制调试记录失败', err)
+    },
+    publish: (done) => {
+      autoDone.value = done
+    },
+  })
+  await nextTick()
+  if (persistTimer) {
+    window.clearTimeout(persistTimer)
+    persistTimer = undefined
+  }
+}
+
+/** Merge successful names into existing record (or create). */
+export async function appendDramaVideoSuccess(args: {
+  path: string
+  name: string
+  videoName: string
+  at: string
+}) {
+  const prev = autoDone.value.find((r) => r.path === args.path)
+  const names = new Set(prev?.videoNames ?? [])
+  names.add(args.videoName)
+  const videoNames = [...names]
+  const failures = (prev?.failures ?? []).filter((f) => f.name !== args.videoName)
+  await upsertAutoRecord({
+    path: args.path,
+    name: args.name,
+    completedAt: args.at,
+    videoCount: videoNames.length,
+    videoNames,
+    failures: failures.length ? failures : [],
+  })
+}
+
+export async function recordDramaVideoFailure(args: {
+  path: string
+  name: string
+  videoName: string
+  reason: string
+  at: string
+}) {
+  const prev = autoDone.value.find((r) => r.path === args.path)
+  if (!prev?.videoNames?.length) {
+    // Spec: never create done-only-from-failures for brand-new dramas.
+    // Still update failures if record already exists.
+    if (!prev) return
+  }
+  const failures = [
+    ...(prev.failures ?? []).filter((f) => f.name !== args.videoName),
+    { name: args.videoName, reason: args.reason, at: args.at },
+  ]
+  await upsertAutoRecord({
+    ...prev,
+    failures,
+  })
+}
+
+export async function seedDramaVideoNames(args: {
+  path: string
+  name: string
+  videoNames: string[]
+  at: string
+}) {
+  await upsertAutoRecord({
+    path: args.path,
+    name: args.name,
+    completedAt: args.at,
+    videoCount: args.videoNames.length,
+    videoNames: args.videoNames,
+    failures: [],
+  })
 }
 
 export function clearAutoDone() {

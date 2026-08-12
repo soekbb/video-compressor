@@ -6,7 +6,7 @@ import {
   runAutoDramaJob,
   type AutoDramaQueueItem,
 } from './autoBatch.ts'
-import { publishPersistedDramaDone } from './autoPersistence.ts'
+import { publishPersistedDramaDone, publishUpsertDramaRecord } from './autoPersistence.ts'
 
 const queue: AutoDramaQueueItem[] = [
   {
@@ -176,4 +176,62 @@ test('debug mirror failure does not reject or suppress a persisted completion', 
 
   assert.equal(mirrorCalls, 1)
   assert.equal(published.some((record) => record.path === '/dramas/persisted'), true)
+})
+
+test('upsert merges videoNames and clears matching failures', async () => {
+  const existing = [
+    {
+      path: '/d/a',
+      name: 'A',
+      completedAt: 't0',
+      videoCount: 1,
+      videoNames: ['1.mp4'],
+      failures: [{ name: '2.mp4', reason: '文件被占用', at: 't0' }],
+    },
+  ]
+  let published = existing
+  await publishUpsertDramaRecord(
+    existing,
+    {
+      path: '/d/a',
+      name: 'A',
+      completedAt: 't1',
+      videoCount: 2,
+      videoNames: ['1.mp4', '2.mp4'],
+      failures: [],
+    },
+    {
+      persist: async () => {},
+      publish: (r) => {
+        published = r
+      },
+    },
+  )
+  const row = published.find((r) => r.path === '/d/a')!
+  assert.deepEqual(row.videoNames, ['1.mp4', '2.mp4'])
+  assert.deepEqual(row.failures, [])
+  assert.equal(row.videoCount, 2)
+})
+
+test('upsert inserts when path missing', async () => {
+  const existing: Array<{
+    path: string
+    name: string
+    completedAt: string
+    videoCount: number
+    videoNames?: string[]
+  }> = []
+  let published = existing
+  await publishUpsertDramaRecord(
+    existing,
+    {
+      path: '/d/new',
+      name: 'New',
+      completedAt: 't',
+      videoCount: 1,
+      videoNames: ['a.mp4'],
+    },
+    { persist: async () => {}, publish: (r) => { published = r } },
+  )
+  assert.equal(published[0]?.path, '/d/new')
 })
