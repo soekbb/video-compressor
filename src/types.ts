@@ -38,7 +38,15 @@ export type DramaFolder = {
   name: string
   path: string
   videoCount: number
+  /** Unix ms folder birth/ctime/mtime from Rust; 0 if unknown */
+  createdAtMs: number
   videos: { name: string; path: string; size: number }[]
+}
+
+export type AutoVideoFailure = {
+  name: string
+  reason: string
+  at: string
 }
 
 export type AutoRecord = {
@@ -46,4 +54,6 @@ export type AutoRecord = {
   name: string
   completedAt: string
   videoCount: number
+  videoNames?: string[]
+  failures?: AutoVideoFailure[]
 }
