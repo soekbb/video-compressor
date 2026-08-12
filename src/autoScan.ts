@@ -27,8 +27,8 @@ export function seedVideoNames(folder: { videos: { name: string }[] }): string[]
 
 /**
  * Videos to compress for a drama this scan pass.
- * - null: legacy record without videoNames → seed only, do not compress
- * - []: skip (too old, or nothing pending)
+ * - null: legacy record without videoNames, folder ≤2d → seed only, do not compress
+ * - []: skip (too old including legacy, or nothing pending)
  * - T[]: enqueue these
  */
 export function videosToProcess<T extends { name: string }>(
@@ -39,11 +39,12 @@ export function videosToProcess<T extends { name: string }>(
   if (!record) {
     return folder.videos
   }
-  if (!record.videoNames) {
-    return null
-  }
   if (!shouldMonitorOldDrama(folder.createdAtMs, nowMs)) {
     return []
+  }
+  // Legacy done row without videoNames: seed only when still within 2 days
+  if (!record.videoNames) {
+    return null
   }
   return pendingVideosForDrama(folder, record)
 }

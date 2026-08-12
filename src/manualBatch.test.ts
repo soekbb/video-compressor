@@ -168,3 +168,31 @@ test('cancellation neither retries nor reports progress after cancellation', asy
   assert.deepEqual(harness.completions, [])
   assert.deepEqual(harness.failures, [])
 })
+
+test('onItemDone fires for each completed item before cancel returns', async () => {
+  const second: ManualBatchQueueItem = {
+    id: 'second',
+    inputPath: '/inputs/two.mp4',
+    outputDir: '/outputs',
+    outputName: 'two_batch.mp4',
+    outputPath: '/outputs/two_batch.mp4',
+  }
+  const doneNames: string[] = []
+  let cancelled = false
+  const harness = createOperations({
+    isCancelled: () => cancelled,
+    compress: async (item: ManualBatchQueueItem) => {
+      if (item.id === 'first') return
+      cancelled = true
+      throw new Error('cancelled')
+    },
+    onItemDone: async (item: ManualBatchQueueItem, outcome: string) => {
+      doneNames.push(`${item.id}:${outcome}`)
+    },
+  })
+
+  await runManualBatchJob([firstItem, second], 1, harness.operations)
+
+  assert.deepEqual(doneNames, ['first:completed'])
+  assert.equal(harness.cancellations, 1)
+})

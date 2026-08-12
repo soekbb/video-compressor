@@ -20,6 +20,10 @@ type AutoDramaOperations = {
   ) => Promise<unknown>
   isCancelled: () => boolean
   onProgress: (progress: number, counts: { doneCount: number; videoCount: number }) => void
+  onItemDone?: (
+    item: AutoDramaQueueItem,
+    outcome: 'completed' | 'skipped',
+  ) => void | Promise<void>
 }
 
 export async function runAutoDramaJob(

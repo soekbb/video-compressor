@@ -58,13 +58,22 @@ test('videosToProcess: new drama returns all videos', () => {
   )
 })
 
-test('videosToProcess: missing videoNames signals seed-only', () => {
+test('videosToProcess: missing videoNames signals seed-only within 2 days', () => {
   const now = 1_700_000_000_000
   const folder = {
     createdAtMs: now - 1000,
     videos: [{ name: 'a.mp4' }],
   }
   assert.equal(videosToProcess(folder, { videoNames: undefined }, now), null)
+})
+
+test('videosToProcess: missing videoNames beyond 2 days skips without seed', () => {
+  const now = 1_700_000_000_000
+  const folder = {
+    createdAtMs: now - TWO_DAYS_MS - 1,
+    videos: [{ name: 'a.mp4' }],
+  }
+  assert.deepEqual(videosToProcess(folder, { videoNames: undefined }, now), [])
 })
 
 test('videosToProcess: old drama beyond 2 days returns empty', () => {

@@ -317,6 +317,15 @@ async function submitDrama(job: DramaJob) {
             outputName: item.outputName,
             onProgress,
           }),
+        // 每成功一个就落盘，取消时不会丢掉已原位替换的文件
+        onItemDone: async (item) => {
+          await appendDramaVideoSuccess({
+            path: folder.path,
+            name: folder.name,
+            videoName: item.outputName,
+            at: new Date().toLocaleString(),
+          })
+        },
         onProgress: (progress, counts) => {
           jobs.value = jobs.value.map((j) =>
             j.path === job.path
@@ -338,28 +347,17 @@ async function submitDrama(job: DramaJob) {
         return
       }
 
+      // 成功已在 onItemDone 写入；失败统一在成功之后记录，避免无 prev 时被丢弃
       const at = new Date().toLocaleString()
-      const failedByPath = new Map(
-        result.meta.failures.map((f) => [f.inputPath, f.message] as const),
-      )
-      for (const item of queue) {
-        const failMessage = failedByPath.get(item.inputPath)
-        if (failMessage !== undefined) {
-          await recordDramaVideoFailure({
-            path: folder.path,
-            name: folder.name,
-            videoName: item.outputName,
-            reason: failMessage,
-            at,
-          })
-        } else {
-          await appendDramaVideoSuccess({
-            path: folder.path,
-            name: folder.name,
-            videoName: item.outputName,
-            at,
-          })
-        }
+      for (const failure of result.meta.failures) {
+        const item = queue.find((q) => q.inputPath === failure.inputPath)
+        await recordDramaVideoFailure({
+          path: folder.path,
+          name: folder.name,
+          videoName: item?.outputName ?? failure.inputPath.split(/[/\\]/).pop() ?? failure.inputPath,
+          reason: failure.message,
+          at,
+        })
       }
 
       if (result.status === 'failed') {

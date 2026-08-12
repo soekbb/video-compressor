@@ -31,6 +31,11 @@ type ManualBatchOperations = {
   ) => Promise<unknown>
   isCancelled: () => boolean
   onProgress: (progress: number, counts: { doneCount: number; videoCount: number }) => void
+  /** Fired after each item finishes successfully (compress or skip); awaited before next work / cancel. */
+  onItemDone?: (
+    item: ManualBatchQueueItem,
+    outcome: 'completed' | 'skipped',
+  ) => void | Promise<void>
   onComplete: (meta: ManualBatchMeta) => void
   onFail: (message: string, meta: ManualBatchMeta) => void
   onCancelled: () => void
@@ -87,8 +92,10 @@ export async function runManualBatchJob(
       if (result.status === 'cancelled') break
       if (result.status === 'completed') {
         completedCount += 1
+        await operations.onItemDone?.(item, 'completed')
       } else if (result.status === 'skipped') {
         skippedCount += 1
+        await operations.onItemDone?.(item, 'skipped')
       } else {
         failures.push(result.failure)
       }
