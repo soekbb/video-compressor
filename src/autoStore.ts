@@ -266,10 +266,18 @@ export async function seedDramaVideoNames(args: {
   )
 }
 
-export function clearAutoDone() {
-  autoDone.value = []
+export async function clearAutoDone() {
+  await runAutoDoneWrite(async () => {
+    autoDone.value = []
+    await persistAutoStoreNow()
+    await finishDoneWrite()
+  })
 }
 
-export function removeAutoDone(path: string) {
-  autoDone.value = autoDone.value.filter((r) => r.path !== path)
+export async function removeAutoDone(path: string) {
+  await runAutoDoneWrite(async () => {
+    autoDone.value = autoDone.value.filter((r) => r.path !== path)
+    await persistAutoStoreNow()
+    await finishDoneWrite()
+  })
 }

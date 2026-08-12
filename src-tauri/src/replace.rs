@@ -20,6 +20,7 @@ pub fn temp_output_path(final_path: &Path) -> PathBuf {
   parent.join(format!(".影工临时_{stem}_{id}{ext}"))
 }
 
+#[cfg(unix)]
 fn pids_holding(path: &Path) -> Vec<u32> {
   let path_str = path.to_string_lossy();
   let output = Command::new("lsof")
@@ -36,6 +37,13 @@ fn pids_holding(path: &Path) -> Vec<u32> {
     .filter_map(|l| l.trim().parse::<u32>().ok())
     .filter(|pid| *pid != std::process::id())
     .collect()
+}
+
+/// Windows: no reliable lightweight lock-holder scan (no fake `lsof`).
+/// Occupied replaces still surface via `looks_occupied` / `文件被占用`.
+#[cfg(not(unix))]
+fn pids_holding(_path: &Path) -> Vec<u32> {
+  vec![]
 }
 
 fn kill_pid(pid: u32) {
