@@ -30,6 +30,7 @@ pub struct DramaFolder {
   pub name: String,
   pub path: String,
   pub video_count: usize,
+  pub created_at_ms: u64,
   pub videos: Vec<DramaVideo>,
 }
 
@@ -356,6 +357,40 @@ fn is_video_file(path: &Path) -> bool {
     .unwrap_or(false)
 }
 
+fn should_skip_video_name(name: &str) -> bool {
+  // 隐藏文件 + 原位压制临时输出 `.影工临时_*`
+  name.starts_with('.')
+}
+
+fn system_time_to_ms(t: std::time::SystemTime) -> u64 {
+  t.duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis() as u64)
+    .unwrap_or(0)
+}
+
+/// Folder age: birth → ctime (unix) → mtime.
+fn folder_created_at_ms(path: &Path) -> u64 {
+  let meta = match fs::metadata(path) {
+    Ok(m) => m,
+    Err(_) => return 0,
+  };
+  if let Ok(t) = meta.created() {
+    return system_time_to_ms(t);
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    let ctime_ms = (meta.ctime() as u64).saturating_mul(1000);
+    if ctime_ms > 0 {
+      return ctime_ms;
+    }
+  }
+  if let Ok(t) = meta.modified() {
+    return system_time_to_ms(t);
+  }
+  0
+}
+
 fn collect_videos(dir: &Path) -> Vec<DramaVideo> {
   let Ok(entries) = fs::read_dir(dir) else {
     return vec![];
@@ -366,12 +401,15 @@ fn collect_videos(dir: &Path) -> Vec<DramaVideo> {
     if !path.is_file() || !is_video_file(&path) {
       continue;
     }
-    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let name = path
       .file_name()
       .and_then(|n| n.to_str())
       .unwrap_or("video")
       .to_string();
+    if should_skip_video_name(&name) {
+      continue;
+    }
+    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     videos.push(DramaVideo {
       name,
       path: path.to_string_lossy().to_string(),
@@ -420,6 +458,7 @@ pub fn list_drama_folders(watch_dir: String) -> Result<Vec<DramaFolder>, String>
       name: name.clone(),
       path: path.to_string_lossy().to_string(),
       video_count: videos.len(),
+      created_at_ms: folder_created_at_ms(&path),
       videos,
     });
   }
@@ -787,4 +826,54 @@ pub async fn merge_videos(
   .map_err(|e| format!("合成任务异常：{e}"))?;
 
   result
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  #[test]
+  fn skips_temp_and_hidden_video_names() {
+    assert!(should_skip_video_name(".影工临时_01_abcd.mp4"));
+    assert!(should_skip_video_name(".hidden.mp4"));
+    assert!(!should_skip_video_name("01.mp4"));
+    assert!(!should_skip_video_name("episode.mp4"));
+  }
+
+  #[test]
+  fn folder_created_at_ms_reads_existing_dir() {
+    let dir = std::env::temp_dir().join(format!(
+      "video-compressor-folder-age-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let ms = folder_created_at_ms(&dir);
+    assert!(ms > 0, "expected nonzero folder age, got {ms}");
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn collect_videos_excludes_temp_outputs() {
+    let dir = std::env::temp_dir().join(format!(
+      "video-compressor-collect-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("01.mp4"), [1]).unwrap();
+    fs::write(dir.join(".影工临时_01_x.mp4"), [1]).unwrap();
+    let videos = collect_videos(&dir);
+    assert_eq!(videos.len(), 1);
+    assert_eq!(videos[0].name, "01.mp4");
+    let _ = fs::remove_dir_all(&dir);
+  }
 }
