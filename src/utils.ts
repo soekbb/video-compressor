@@ -62,7 +62,7 @@ type BatchCompressionFailure = {
 }
 
 export type BatchCompressionItemResult =
-  | { status: 'completed' }
+  | { status: 'completed'; encoder?: string }
   | { status: 'skipped' }
   | { status: 'cancelled' }
   | { status: 'failed'; failure: BatchCompressionFailure }
@@ -96,8 +96,16 @@ export async function runBatchCompressionItem(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (operations.isCancelled()) return { status: 'cancelled' }
     try {
-      await operations.compress()
-      return operations.isCancelled() ? { status: 'cancelled' } : { status: 'completed' }
+      const compressResult = await operations.compress()
+      if (operations.isCancelled()) return { status: 'cancelled' }
+      const encoder =
+        compressResult &&
+        typeof compressResult === 'object' &&
+        'encoder' in compressResult &&
+        typeof (compressResult as { encoder?: unknown }).encoder === 'string'
+          ? String((compressResult as { encoder: string }).encoder)
+          : undefined
+      return { status: 'completed', encoder }
     } catch (error) {
       if (operations.isCancelled()) return { status: 'cancelled' }
       if (attempt === 1) {

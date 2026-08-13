@@ -59,6 +59,8 @@ pub struct CompressProgressPayload {
 pub struct CompressResult {
   pub output_path: String,
   pub output_size: u64,
+  /// 实际采用的编码器短标签：VT / x264 / NVENC …
+  pub encoder: String,
 }
 
 pub struct CompressState {
@@ -410,7 +412,7 @@ pub async fn compress_video(
   let result = tauri::async_runtime::spawn_blocking(move || {
     use crate::encode::{
       append_audio_aac_args, append_video_encode_args, encoder_fallback_chain,
-      mark_hw_encoder_failed, VideoEncoderKind,
+      note_hw_encode_failed, note_hw_encode_success, VideoEncoderKind,
     };
     use crate::replace::replace_file_force;
 
@@ -528,6 +530,7 @@ pub async fn compress_video(
           if encoder == VideoEncoderKind::X264 {
             return Err(last_err);
           }
+          note_hw_encode_failed();
           continue;
         }
 
@@ -538,6 +541,10 @@ pub async fn compress_video(
         let output_size = fs::metadata(&final_path_clone)
           .map(|m| m.len())
           .unwrap_or(0);
+
+        if encoder.is_hardware() {
+          note_hw_encode_success();
+        }
 
         let _ = app_for_progress.emit(
           "compress-progress",
@@ -550,6 +557,7 @@ pub async fn compress_video(
         return Ok(CompressResult {
           output_path: final_path_clone.to_string_lossy().to_string(),
           output_size,
+          encoder: encoder.short_label().to_string(),
         });
       }
 
@@ -564,8 +572,8 @@ pub async fn compress_video(
       if encoder == VideoEncoderKind::X264 {
         break;
       }
-      // 硬编失败：本进程后续任务直接软编，避免每个文件都先失败一次
-      mark_hw_encoder_failed();
+      // 硬编失败：累计次数，达阈值后冷却再试（非永久禁用）
+      note_hw_encode_failed();
     }
 
     let _ = fs::remove_file(&encode_path_clone);
@@ -575,6 +583,12 @@ pub async fn compress_video(
   .map_err(|e| format!("压缩任务异常：{e}"))?;
 
   result
+}
+
+#[tauri::command]
+pub fn get_encoder_status(app: AppHandle) -> Result<crate::encode::EncoderStatus, String> {
+  let ffmpeg = resolve_bin(&app, "ffmpeg")?;
+  Ok(crate::encode::encoder_status(&ffmpeg))
 }
 
 #[tauri::command]

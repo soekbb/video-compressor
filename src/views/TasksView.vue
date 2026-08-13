@@ -23,6 +23,7 @@ type StatusFilter = 'all' | 'active' | 'ended'
 
 const statusFilter = ref<StatusFilter>('all')
 const expandedFailureIds = ref(new Set<string>())
+const expandedEncoderIds = ref(new Set<string>())
 
 const filters: { id: StatusFilter; label: string }[] = [
   { id: 'all', label: '全部' },
@@ -88,6 +89,35 @@ function countText(task: AppTask) {
 
 function durationText(task: AppTask) {
   return formatDuration(resolveDurationMs(task))
+}
+
+function encoderSummaryText(task: AppTask) {
+  const meta = parseTaskMeta(task.meta)
+  if (typeof meta.encoderSummary === 'string' && meta.encoderSummary.trim()) {
+    return meta.encoderSummary.trim()
+  }
+  return ''
+}
+
+function encoderFiles(task: AppTask) {
+  const meta = parseTaskMeta(task.meta)
+  const list = meta.encoderByFile
+  if (!Array.isArray(list)) return []
+  return list.filter(
+    (item): item is { name: string; encoder: string } =>
+      typeof item?.name === 'string' && typeof item?.encoder === 'string',
+  )
+}
+
+function isEncoderExpanded(taskId: string) {
+  return expandedEncoderIds.value.has(taskId)
+}
+
+function toggleEncoderDetails(taskId: string) {
+  const next = new Set(expandedEncoderIds.value)
+  if (next.has(taskId)) next.delete(taskId)
+  else next.add(taskId)
+  expandedEncoderIds.value = next
 }
 
 function footerText(task: AppTask) {
@@ -222,6 +252,10 @@ async function onReveal(task: AppTask) {
                   <span class="dot">·</span>
                   <span class="duration-text">耗时 {{ durationText(task) }}</span>
                 </template>
+                <template v-if="encoderSummaryText(task)">
+                  <span class="dot">·</span>
+                  <span class="encoder-text">{{ encoderSummaryText(task) }}</span>
+                </template>
               </p>
               <p
                 v-if="task.status === 'error' || task.status === 'cancelled'"
@@ -243,6 +277,20 @@ async function onReveal(task: AppTask) {
                   isFailureExpanded(task.id)
                     ? '收起错误详情'
                     : `查看错误详情（${taskFailures(task).length}）`
+                }}
+              </button>
+              <button
+                v-if="encoderFiles(task).length"
+                type="button"
+                class="failure-toggle"
+                :aria-expanded="isEncoderExpanded(task.id)"
+                :aria-controls="`task-encoders-${task.id}`"
+                @click="toggleEncoderDetails(task.id)"
+              >
+                {{
+                  isEncoderExpanded(task.id)
+                    ? '收起编码器明细'
+                    : `查看编码器明细（${encoderFiles(task).length}）`
                 }}
               </button>
             </div>
@@ -291,6 +339,23 @@ async function onReveal(task: AppTask) {
                   <p class="failure-name">{{ failureFilename(failure.inputPath) }}</p>
                   <p class="failure-path">{{ failure.inputPath }}</p>
                   <pre class="failure-message">{{ failure.message }}</pre>
+                </li>
+              </ul>
+            </div>
+
+            <div
+              v-if="encoderFiles(task).length && isEncoderExpanded(task.id)"
+              :id="`task-encoders-${task.id}`"
+              class="failure-details"
+            >
+              <p class="failure-details-title">每文件实际编码器</p>
+              <ul class="failure-list">
+                <li
+                  v-for="(item, index) in encoderFiles(task)"
+                  :key="`${item.name}-${item.encoder}-${index}`"
+                  class="failure-item"
+                >
+                  <p class="failure-name">{{ item.name }} · {{ item.encoder }}</p>
                 </li>
               </ul>
             </div>

@@ -6,6 +6,17 @@ import { getConcurrency, getQualityPreset } from './settings'
 export type CompressResult = {
   outputPath: string
   outputSize: number
+  /** 实际编码器短标签：VT / x264 / NVENC … */
+  encoder?: string
+}
+
+export type EncoderStatus = {
+  availableHw: string | null
+  mode: 'hardware' | 'software' | string
+  modeLabel: string
+  cooldownRemainingSec: number
+  consecutiveHwFailures: number
+  hwFailThreshold: number
 }
 
 export type CompressProgress = {
@@ -20,6 +31,11 @@ export function getCompressConcurrency() {
 export async function isCompressedOutputValid(path: string): Promise<boolean> {
   if (!isTauri() || !path) return false
   return invoke<boolean>('is_compressed_output_valid', { path })
+}
+
+export async function getEncoderStatus(): Promise<EncoderStatus | null> {
+  if (!isTauri()) return null
+  return invoke<EncoderStatus>('get_encoder_status')
 }
 
 /** 开始一批编码前清除该任务的取消标记 */

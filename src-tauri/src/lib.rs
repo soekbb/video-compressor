@@ -8,8 +8,8 @@ mod sysinfo;
 mod tasks;
 
 use compress::{
-  cancel_compress, cleanup_orphan_ffmpeg, compress_video, is_compressed_output_valid,
-  prepare_compress_batch, CompressState,
+  cancel_compress, cleanup_orphan_ffmpeg, compress_video, get_encoder_status,
+  is_compressed_output_valid, prepare_compress_batch, CompressState,
 };
 use media::{list_drama_folders, merge_videos, probe_video_dimensions};
 use persist::{load_auto_state, save_auto_state};
@@ -31,6 +31,7 @@ pub fn run() {
     .manage(Arc::new(CompressState::default()))
     .invoke_handler(tauri::generate_handler![
       compress_video,
+      get_encoder_status,
       is_compressed_output_valid,
       prepare_compress_batch,
       cancel_compress,

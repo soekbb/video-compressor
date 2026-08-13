@@ -1,3 +1,9 @@
+import {
+  bumpEncoderCount,
+  fileNameFromPath,
+  formatEncoderSummary,
+  type EncoderFileUse,
+} from './encoderMeta.ts'
 import { assertUniqueOutputPaths, runBatchCompressionItem } from './utils.ts'
 
 export type ManualBatchQueueItem = {
@@ -20,6 +26,9 @@ export type ManualBatchMeta = {
   completedCount: number
   skippedCount: number
   failures: ManualBatchFailure[]
+  encoderCounts?: Record<string, number>
+  encoderByFile?: EncoderFileUse[]
+  encoderSummary?: string
 }
 
 type ManualBatchOperations = {
@@ -54,6 +63,8 @@ export async function runManualBatchJob(
   let skippedCount = 0
   const failures: ManualBatchFailure[] = []
   const itemProgress = new Map<string, number>()
+  const encoderCounts: Record<string, number> = {}
+  const encoderByFile: EncoderFileUse[] = []
 
   function refreshProgress() {
     if (operations.isCancelled()) return
@@ -92,6 +103,13 @@ export async function runManualBatchJob(
       if (result.status === 'cancelled') break
       if (result.status === 'completed') {
         completedCount += 1
+        if (result.encoder) {
+          bumpEncoderCount(encoderCounts, result.encoder)
+          encoderByFile.push({
+            name: item.outputName || fileNameFromPath(item.inputPath),
+            encoder: result.encoder,
+          })
+        }
         await operations.onItemDone?.(item, 'completed')
       } else if (result.status === 'skipped') {
         skippedCount += 1
@@ -112,6 +130,7 @@ export async function runManualBatchJob(
   }
 
   const doneCount = completedCount + skippedCount
+  const encoderSummary = formatEncoderSummary(encoderCounts)
   const meta: ManualBatchMeta = {
     outputDir: queue[0]?.outputDir ?? '',
     videoCount: queue.length,
@@ -119,6 +138,9 @@ export async function runManualBatchJob(
     completedCount,
     skippedCount,
     failures,
+    ...(Object.keys(encoderCounts).length
+      ? { encoderCounts, encoderByFile, encoderSummary }
+      : {}),
   }
 
   if (failures.length === 0 && doneCount >= queue.length) {

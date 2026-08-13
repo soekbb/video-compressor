@@ -40,7 +40,7 @@ test('initial compression failure retries exactly once', async () => {
     isCancelled: () => false,
   })
 
-  assert.deepEqual(result, { status: 'completed' })
+  assert.deepEqual(result, { status: 'completed', encoder: undefined })
   assert.equal(compressCalls, 2)
 })
 

@@ -187,7 +187,15 @@ async function pumpQueue() {
       if (!task || task.status === 'cancelled') continue
 
       currentRunningId = job.taskId
-      patchLocal(job.taskId, { status: 'running', error: undefined }, true)
+      patchLocal(
+        job.taskId,
+        {
+          status: 'running',
+          error: undefined,
+          meta: mergeMeta(task, { startedAt: nowIso() }),
+        },
+        true,
+      )
       try {
         await job.run()
       } catch (e) {
@@ -230,8 +238,16 @@ export type TaskMeta = {
   outputDir?: string
   outputPath?: string
   dramaPath?: string
+  /** 真正开始执行（离开排队）的时间；耗时从此刻起算，不含等待 */
+  startedAt?: string
   finishedAt?: string
   durationMs?: number
+  /** 编码器使用统计，如 { VT: 72, x264: 8 } */
+  encoderCounts?: Record<string, number>
+  /** 每文件实际编码器 */
+  encoderByFile?: Array<{ name: string; encoder: string }>
+  /** 如 VT×72 · x264×8 */
+  encoderSummary?: string
   [key: string]: unknown
 }
 
@@ -259,9 +275,16 @@ function mergeMeta(current: AppTask | undefined, patch?: TaskMeta): string | und
   return JSON.stringify({ ...parseTaskMeta(current?.meta), ...patch })
 }
 
+function resolveStartMs(current: AppTask | undefined): number {
+  if (!current) return NaN
+  const meta = parseTaskMeta(current.meta)
+  const startRaw = meta.startedAt || current.createdAt
+  return Date.parse(String(startRaw).replace(' ', 'T'))
+}
+
 function withDuration(current: AppTask | undefined, patch?: TaskMeta): TaskMeta {
   const finishedAt = nowIso()
-  const started = current ? Date.parse(current.createdAt) : NaN
+  const started = resolveStartMs(current)
   const durationMs = Number.isFinite(started) ? Math.max(0, Date.parse(finishedAt) - started) : 0
   return { ...patch, finishedAt, durationMs }
 }
@@ -342,7 +365,7 @@ export function resolveDurationMs(task: AppTask): number | undefined {
     return Math.max(0, Number(meta.durationMs))
   }
   const endRaw = meta.finishedAt || task.updatedAt
-  const start = Date.parse(task.createdAt)
+  const start = resolveStartMs(task)
   const end = Date.parse(String(endRaw).replace(' ', 'T'))
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined
   return end - start

@@ -6,7 +6,7 @@ import type { AppSettings, QualityPreset } from './types'
 const STORAGE_KEY = 'kuaiya-settings'
 
 const defaults: AppSettings = {
-  concurrency: 1,
+  concurrency: 2,
   scanIntervalMinutes: 3,
   qualityPreset: 'size',
   autoScanOnLaunch: false,

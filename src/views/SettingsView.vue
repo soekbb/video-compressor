@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { getEncoderStatus, type EncoderStatus } from '../compress'
 import { settings, settingsReady, updateSettings } from '../settings'
 import {
   formatMemory,
@@ -16,7 +17,9 @@ const intervalInput = ref(String(settings.value.scanIntervalMinutes))
 const qualityPreset = ref<QualityPreset>(settings.value.qualityPreset)
 const autoScanOnLaunch = ref(settings.value.autoScanOnLaunch)
 const systemInfo = ref<SystemInfo | null>(null)
+const encoderStatus = ref<EncoderStatus | null>(null)
 let tipTimer: number | undefined
+let encoderTimer: number | undefined
 
 const recommendedConcurrency = computed(() =>
   systemInfo.value ? recommendConcurrency(systemInfo.value.cpuCores) : null,
@@ -50,10 +53,26 @@ function syncFromSaved() {
   autoScanOnLaunch.value = settings.value.autoScanOnLaunch
 }
 
+async function refreshEncoderStatus() {
+  try {
+    encoderStatus.value = await getEncoderStatus()
+  } catch {
+    encoderStatus.value = null
+  }
+}
+
 onMounted(() => {
   void loadSystemInfo().then((info) => {
     systemInfo.value = info
   })
+  void refreshEncoderStatus()
+  encoderTimer = window.setInterval(() => {
+    void refreshEncoderStatus()
+  }, 5000)
+})
+
+onBeforeUnmount(() => {
+  if (encoderTimer) window.clearInterval(encoderTimer)
 })
 
 watch(
@@ -175,6 +194,16 @@ function setAutoScan(enabled: boolean) {
             <li v-if="memoryLabel">
               <span class="spec-label">内存</span>
               <span class="spec-value">{{ memoryLabel }}</span>
+            </li>
+            <li>
+              <span class="spec-label">编码器</span>
+              <span class="spec-value">{{ encoderStatus?.modeLabel || '读取中…' }}</span>
+            </li>
+            <li v-if="encoderStatus && encoderStatus.consecutiveHwFailures > 0">
+              <span class="spec-label">硬编连续失败</span>
+              <span class="spec-value">
+                {{ encoderStatus.consecutiveHwFailures }} / {{ encoderStatus.hwFailThreshold }}
+              </span>
             </li>
           </ul>
         </div>

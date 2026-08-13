@@ -118,7 +118,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     .execute(
       "INSERT OR IGNORE INTO settings
          (id, concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch)
-       VALUES (1, 1, 3, 'size', 0)",
+       VALUES (1, 2, 3, 'size', 0)",
       [],
     )
     .map_err(|e| format!("初始化设置失败：{e}"))?;

@@ -71,6 +71,43 @@ test('collision preflight aborts before any Tauri invoke', async () => {
   assert.deepEqual(harness.invokes, [])
 })
 
+test('completed items record encoder counts and per-file uses', async () => {
+  const second: ManualBatchQueueItem = {
+    id: 'second',
+    inputPath: '/inputs/other.mp4',
+    outputDir: '/outputs',
+    outputName: 'other_batch.mp4',
+    outputPath: '/outputs/other_batch.mp4',
+  }
+  let n = 0
+  const harness = createOperations({
+    compress: async () => {
+      harness.invokes.push('compress')
+      n += 1
+      return { encoder: n === 1 ? 'VT' : 'x264' }
+    },
+  })
+
+  await runManualBatchJob([firstItem, second], 1, harness.operations)
+
+  assert.deepEqual(harness.completions, [
+    {
+      outputDir: '/outputs',
+      videoCount: 2,
+      doneCount: 2,
+      completedCount: 2,
+      skippedCount: 0,
+      failures: [],
+      encoderCounts: { VT: 1, x264: 1 },
+      encoderByFile: [
+        { name: 'clip_batch.mp4', encoder: 'VT' },
+        { name: 'other_batch.mp4', encoder: 'x264' },
+      ],
+      encoderSummary: 'VT×1 · x264×1',
+    },
+  ])
+})
+
 test('validated output skips compression and persists skipped count', async () => {
   const harness = createOperations({
     isOutputValid: async () => {
