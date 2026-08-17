@@ -362,6 +362,81 @@ fn should_skip_video_name(name: &str) -> bool {
   name.starts_with('.')
 }
 
+fn should_skip_dir_name(name: &str) -> bool {
+  name.is_empty()
+    || name.starts_with('.')
+    || name == "影工输出"
+    || name == "快压输出"
+    || name == "_compressed"
+}
+
+/// 自监控根起最多扫描的相对深度（根为 0，直接子目录为 1）。
+const MAX_DRAMA_DEPTH: usize = 8;
+
+fn relative_drama_name(root: &Path, dir: &Path) -> String {
+  dir.strip_prefix(root)
+    .unwrap_or(dir)
+    .to_string_lossy()
+    .replace('\\', "/")
+}
+
+fn is_strict_descendant(ancestor: &Path, maybe_child: &Path) -> bool {
+  maybe_child.starts_with(ancestor) && maybe_child != ancestor
+}
+
+/// 递归收集「本层有视频」的目录；depth 为相对监控根的深度。
+fn collect_drama_candidates(
+  root: &Path,
+  dir: &Path,
+  depth: usize,
+  out: &mut Vec<(PathBuf, Vec<DramaVideo>)>,
+) {
+  if depth > MAX_DRAMA_DEPTH {
+    return;
+  }
+
+  if depth >= 1 {
+    let videos = collect_videos(dir);
+    if !videos.is_empty() {
+      out.push((dir.to_path_buf(), videos));
+    }
+  }
+
+  let Ok(entries) = fs::read_dir(dir) else {
+    return;
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if !path.is_dir() {
+      continue;
+    }
+    let name = path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("")
+      .to_string();
+    if should_skip_dir_name(&name) {
+      continue;
+    }
+    collect_drama_candidates(root, &path, depth + 1, out);
+  }
+}
+
+/// 有更深「本层有视频」后代时，丢弃祖先候选。
+fn prefer_deeper_dramas(
+  candidates: Vec<(PathBuf, Vec<DramaVideo>)>,
+) -> Vec<(PathBuf, Vec<DramaVideo>)> {
+  candidates
+    .iter()
+    .filter(|(path, _)| {
+      !candidates
+        .iter()
+        .any(|(other, _)| is_strict_descendant(path, other))
+    })
+    .cloned()
+    .collect()
+}
+
 fn system_time_to_ms(t: std::time::SystemTime) -> u64 {
   t.duration_since(std::time::UNIX_EPOCH)
     .map(|d| d.as_millis() as u64)
@@ -427,35 +502,18 @@ pub fn list_drama_folders(watch_dir: String) -> Result<Vec<DramaFolder>, String>
     return Err(format!("监控目录不存在：{watch_dir}"));
   }
 
-  let mut folders = Vec::new();
-  let entries = fs::read_dir(&root).map_err(|e| format!("无法读取监控目录：{e}"))?;
+  let mut candidates = Vec::new();
+  collect_drama_candidates(&root, &root, 0, &mut candidates);
+  let kept = prefer_deeper_dramas(candidates);
 
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if !path.is_dir() {
+  let mut folders = Vec::with_capacity(kept.len());
+  for (path, videos) in kept {
+    let name = relative_drama_name(&root, &path);
+    if name.is_empty() {
       continue;
     }
-    let name = path
-      .file_name()
-      .and_then(|n| n.to_str())
-      .unwrap_or("")
-      .to_string();
-    if name.is_empty()
-      || name.starts_with('.')
-      || name == "影工输出"
-      || name == "快压输出"
-      || name == "_compressed"
-    {
-      continue;
-    }
-
-    let videos = collect_videos(&path);
-    if videos.is_empty() {
-      continue;
-    }
-
     folders.push(DramaFolder {
-      name: name.clone(),
+      name,
       path: path.to_string_lossy().to_string(),
       video_count: videos.len(),
       created_at_ms: folder_created_at_ms(&path),
@@ -875,5 +933,75 @@ mod tests {
     assert_eq!(videos.len(), 1);
     assert_eq!(videos[0].name, "01.mp4");
     let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn list_drama_folders_uses_relative_nested_names() {
+    let root = std::env::temp_dir().join(format!(
+      "video-compressor-deep-name-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let nested = root.join("剧A").join("en");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("01.mp4"), [1]).unwrap();
+
+    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].name, "剧A/en");
+    assert_eq!(folders[0].video_count, 1);
+
+    let _ = fs::remove_dir_all(&root);
+  }
+
+  #[test]
+  fn list_drama_folders_drops_ancestor_when_deeper_has_videos() {
+    let root = std::env::temp_dir().join(format!(
+      "video-compressor-deep-prefer-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let parent = root.join("剧A");
+    let child = parent.join("en");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(parent.join("root-level.mp4"), [1]).unwrap();
+    fs::write(child.join("01.mp4"), [1]).unwrap();
+
+    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    let names: Vec<_> = folders.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["剧A/en"]);
+    assert!(!names.iter().any(|n| *n == "剧A"));
+
+    let _ = fs::remove_dir_all(&root);
+  }
+
+  #[test]
+  fn list_drama_folders_skips_excluded_dir_names_at_any_depth() {
+    let root = std::env::temp_dir().join(format!(
+      "video-compressor-deep-skip-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let excluded = root.join("剧A").join("影工输出");
+    fs::create_dir_all(&excluded).unwrap();
+    fs::write(excluded.join("01.mp4"), [1]).unwrap();
+    let ok = root.join("剧B");
+    fs::create_dir_all(&ok).unwrap();
+    fs::write(ok.join("01.mp4"), [1]).unwrap();
+
+    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    let names: Vec<_> = folders.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["剧B"]);
+
+    let _ = fs::remove_dir_all(&root);
   }
 }
