@@ -36,6 +36,15 @@ pub struct DramaFolder {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DramaScanProgress {
+  pub dirs_scanned: u32,
+  pub dramas_found: u32,
+  pub videos_found: u32,
+  pub current_name: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MergeProgressPayload {
   pub id: String,
   pub progress: u32,
@@ -384,41 +393,77 @@ fn is_strict_descendant(ancestor: &Path, maybe_child: &Path) -> bool {
   maybe_child.starts_with(ancestor) && maybe_child != ancestor
 }
 
+struct DirScan {
+  videos: Vec<DramaVideo>,
+  subdirs: Vec<PathBuf>,
+}
+
+/// 一次 read_dir：同时收集本层视频与子目录，避免每个目录扫两遍。
+fn scan_dir_once(dir: &Path) -> DirScan {
+  let Ok(entries) = fs::read_dir(dir) else {
+    return DirScan {
+      videos: vec![],
+      subdirs: vec![],
+    };
+  };
+  let mut videos = Vec::new();
+  let mut subdirs = Vec::new();
+  for entry in entries.flatten() {
+    let file_type = match entry.file_type() {
+      Ok(t) => t,
+      Err(_) => continue,
+    };
+    let path = entry.path();
+    let name = entry
+      .file_name()
+      .to_str()
+      .unwrap_or("")
+      .to_string();
+    if file_type.is_dir() {
+      if !should_skip_dir_name(&name) {
+        subdirs.push(path);
+      }
+      continue;
+    }
+    if !file_type.is_file() || !is_video_file(&path) || should_skip_video_name(&name) {
+      continue;
+    }
+    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+    videos.push(DramaVideo {
+      name,
+      path: path.to_string_lossy().to_string(),
+      size,
+    });
+  }
+  videos.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+  DirScan { videos, subdirs }
+}
+
 /// 递归收集「本层有视频」的目录；depth 为相对监控根的深度。
 fn collect_drama_candidates(
   root: &Path,
   dir: &Path,
   depth: usize,
   out: &mut Vec<(PathBuf, Vec<DramaVideo>)>,
+  dirs_scanned: &mut u32,
+  progress: &mut impl FnMut(u32, u32, u32, &str),
 ) {
   if depth > MAX_DRAMA_DEPTH {
     return;
   }
 
-  if depth >= 1 {
-    let videos = collect_videos(dir);
-    if !videos.is_empty() {
-      out.push((dir.to_path_buf(), videos));
-    }
+  *dirs_scanned += 1;
+  let scan = scan_dir_once(dir);
+  if depth >= 1 && !scan.videos.is_empty() {
+    out.push((dir.to_path_buf(), scan.videos));
   }
 
-  let Ok(entries) = fs::read_dir(dir) else {
-    return;
-  };
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if !path.is_dir() {
-      continue;
-    }
-    let name = path
-      .file_name()
-      .and_then(|n| n.to_str())
-      .unwrap_or("")
-      .to_string();
-    if should_skip_dir_name(&name) {
-      continue;
-    }
-    collect_drama_candidates(root, &path, depth + 1, out);
+  let current = relative_drama_name(root, dir);
+  let videos_found: u32 = out.iter().map(|(_, v)| v.len() as u32).sum();
+  progress(*dirs_scanned, out.len() as u32, videos_found, &current);
+
+  for path in scan.subdirs {
+    collect_drama_candidates(root, &path, depth + 1, out, dirs_scanned, progress);
   }
 }
 
@@ -467,43 +512,43 @@ fn folder_created_at_ms(path: &Path) -> u64 {
 }
 
 fn collect_videos(dir: &Path) -> Vec<DramaVideo> {
-  let Ok(entries) = fs::read_dir(dir) else {
-    return vec![];
-  };
-  let mut videos = Vec::new();
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if !path.is_file() || !is_video_file(&path) {
-      continue;
-    }
-    let name = path
-      .file_name()
-      .and_then(|n| n.to_str())
-      .unwrap_or("video")
-      .to_string();
-    if should_skip_video_name(&name) {
-      continue;
-    }
-    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    videos.push(DramaVideo {
-      name,
-      path: path.to_string_lossy().to_string(),
-      size,
-    });
-  }
-  videos.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-  videos
+  scan_dir_once(dir).videos
 }
 
-#[tauri::command]
-pub fn list_drama_folders(watch_dir: String) -> Result<Vec<DramaFolder>, String> {
+fn list_drama_folders_sync(
+  watch_dir: String,
+  mut on_progress: impl FnMut(DramaScanProgress),
+) -> Result<Vec<DramaFolder>, String> {
   let root = PathBuf::from(&watch_dir);
   if !root.is_dir() {
     return Err(format!("监控目录不存在：{watch_dir}"));
   }
 
+  let mut last_emit = std::time::Instant::now();
+  let mut emit = |dirs_scanned: u32, dramas_found: u32, videos_found: u32, current: &str| {
+    let due = dirs_scanned == 1 || dirs_scanned % 8 == 0 || last_emit.elapsed().as_millis() >= 200;
+    if !due {
+      return;
+    }
+    last_emit = std::time::Instant::now();
+    on_progress(DramaScanProgress {
+      dirs_scanned,
+      dramas_found,
+      videos_found,
+      current_name: current.to_string(),
+    });
+  };
+
   let mut candidates = Vec::new();
-  collect_drama_candidates(&root, &root, 0, &mut candidates);
+  let mut dirs_scanned = 0_u32;
+  collect_drama_candidates(
+    &root,
+    &root,
+    0,
+    &mut candidates,
+    &mut dirs_scanned,
+    &mut emit,
+  );
   let kept = prefer_deeper_dramas(candidates);
 
   let mut folders = Vec::with_capacity(kept.len());
@@ -522,7 +567,28 @@ pub fn list_drama_folders(watch_dir: String) -> Result<Vec<DramaFolder>, String>
   }
 
   folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+  let videos_found: u32 = folders.iter().map(|f| f.video_count as u32).sum();
+  on_progress(DramaScanProgress {
+    dirs_scanned,
+    dramas_found: folders.len() as u32,
+    videos_found,
+    current_name: String::new(),
+  });
   Ok(folders)
+}
+
+#[tauri::command]
+pub async fn list_drama_folders(
+  app: AppHandle,
+  watch_dir: String,
+) -> Result<Vec<DramaFolder>, String> {
+  tauri::async_runtime::spawn_blocking(move || {
+    list_drama_folders_sync(watch_dir, |payload| {
+      let _ = app.emit("drama-scan-progress", payload);
+    })
+  })
+  .await
+  .map_err(|e| format!("扫描任务异常：{e}"))?
 }
 
 fn parse_out_time_secs(line: &str) -> Option<f64> {
@@ -949,7 +1015,7 @@ mod tests {
     fs::create_dir_all(&nested).unwrap();
     fs::write(nested.join("01.mp4"), [1]).unwrap();
 
-    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    let folders = list_drama_folders_sync(root.to_string_lossy().to_string(), |_| {}).unwrap();
     assert_eq!(folders.len(), 1);
     assert_eq!(folders[0].name, "剧A/en");
     assert_eq!(folders[0].video_count, 1);
@@ -973,7 +1039,7 @@ mod tests {
     fs::write(parent.join("root-level.mp4"), [1]).unwrap();
     fs::write(child.join("01.mp4"), [1]).unwrap();
 
-    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    let folders = list_drama_folders_sync(root.to_string_lossy().to_string(), |_| {}).unwrap();
     let names: Vec<_> = folders.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, vec!["剧A/en"]);
     assert!(!names.iter().any(|n| *n == "剧A"));
@@ -998,9 +1064,40 @@ mod tests {
     fs::create_dir_all(&ok).unwrap();
     fs::write(ok.join("01.mp4"), [1]).unwrap();
 
-    let folders = list_drama_folders(root.to_string_lossy().to_string()).unwrap();
+    let folders = list_drama_folders_sync(root.to_string_lossy().to_string(), |_| {}).unwrap();
     let names: Vec<_> = folders.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, vec!["剧B"]);
+
+    let _ = fs::remove_dir_all(&root);
+  }
+
+  #[test]
+  fn list_drama_folders_reports_progress_counts() {
+    let root = std::env::temp_dir().join(format!(
+      "video-compressor-scan-progress-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let nested = root.join("剧A").join("en");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("01.mp4"), [1]).unwrap();
+    fs::write(nested.join("02.mp4"), [1]).unwrap();
+
+    let mut reports = Vec::new();
+    let folders = list_drama_folders_sync(root.to_string_lossy().to_string(), |p| {
+      reports.push(p);
+    })
+    .unwrap();
+
+    assert_eq!(folders.len(), 1);
+    assert!(!reports.is_empty());
+    let last = reports.last().unwrap();
+    assert!(last.dirs_scanned >= 3, "root + 剧A + en, got {}", last.dirs_scanned);
+    assert_eq!(last.dramas_found, 1);
+    assert_eq!(last.videos_found, 2);
 
     let _ = fs::remove_dir_all(&root);
   }

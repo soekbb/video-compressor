@@ -14,7 +14,7 @@ import {
 } from '../autoStore'
 import { runAutoDramaJob, type AutoDramaQueueItem } from '../autoBatch'
 import { getCompressConcurrency, compressVideo, prepareCompressBatch } from '../compress'
-import { listDramaFolders } from '../drama'
+import { listDramaFolders, type DramaScanProgress } from '../drama'
 import { isTauri, pickOutputDirectory } from '../desktop'
 import { showDialog } from '../dialog'
 import { initSettings, settings } from '../settings'
@@ -53,6 +53,7 @@ const runningInTauri = isTauri()
 const folders = ref<DramaFolder[]>([])
 const jobs = ref<DramaJob[]>([])
 const isScanning = ref(false)
+const scanProgress = ref<DramaScanProgress | null>(null)
 const isWorking = ref(false)
 const scanError = ref('')
 const nextScanIn = ref(0)
@@ -120,17 +121,32 @@ function canProcess() {
   return autoEnabled.value || manualBurst.value
 }
 
+function scanButtonLabel() {
+  if (!isScanning.value) return '立即扫描'
+  const p = scanProgress.value
+  if (!p || p.dirsScanned <= 0) return '扫描中…'
+  return `扫描中 ${p.dirsScanned} 目录 / ${p.dramasFound} 剧目`
+}
+
+async function runFolderScan() {
+  folders.value = await listDramaFolders(autoWatchDir.value, (progress) => {
+    scanProgress.value = progress
+  })
+  lastScanAt.value = new Date().toLocaleTimeString()
+}
+
 async function refreshFolderList() {
-  if (!runningInTauri || !autoWatchDir.value) return
+  if (!runningInTauri || !autoWatchDir.value || isScanning.value) return
   isScanning.value = true
+  scanProgress.value = null
   scanError.value = ''
   try {
-    folders.value = await listDramaFolders(autoWatchDir.value)
-    lastScanAt.value = new Date().toLocaleTimeString()
+    await runFolderScan()
   } catch (e) {
     scanError.value = e instanceof Error ? e.message : String(e)
   } finally {
     isScanning.value = false
+    scanProgress.value = null
   }
 }
 
@@ -153,11 +169,12 @@ async function scanNow(options?: { notify?: boolean }) {
     scanError.value = '请先选择监控目录'
     return
   }
+  if (isScanning.value) return
   isScanning.value = true
+  scanProgress.value = null
   scanError.value = ''
   try {
-    folders.value = await listDramaFolders(autoWatchDir.value)
-    lastScanAt.value = new Date().toLocaleTimeString()
+    await runFolderScan()
     // 入队前统计待压剧目（入队后会标为 busy，不能再靠 compressPendingFolders）
     const compressPending = compressPendingFolders.value.map((f) => ({
       name: f.name,
@@ -211,6 +228,7 @@ async function scanNow(options?: { notify?: boolean }) {
     }
   } finally {
     isScanning.value = false
+    scanProgress.value = null
     resetCountdown()
   }
 }
@@ -558,13 +576,20 @@ onBeforeUnmount(() => {
             :title="!autoWatchDir ? '请先选择监控目录' : undefined"
             @click="scanNow({ notify: true })"
           >
-            {{ isScanning ? '扫描中…' : '立即扫描' }}
+            {{ scanButtonLabel() }}
           </button>
         </div>
         <p class="summary">
-          待处理 {{ compressPendingFolders.length }} 个剧目 · 已完成记录 {{ autoDone.length }}
-          <template v-if="lastScanAt"> · 上次扫描 {{ lastScanAt }}</template>
-          <template v-if="autoEnabled"> · 下次扫描 {{ formatCountdown(nextScanIn) }}</template>
+          <template v-if="isScanning && scanProgress">
+            已扫 {{ scanProgress.dirsScanned }} 个目录 · 发现 {{ scanProgress.dramasFound }} 个剧目 ·
+            {{ scanProgress.videosFound }} 个视频
+            <template v-if="scanProgress.currentName"> · {{ scanProgress.currentName }}</template>
+          </template>
+          <template v-else>
+            待处理 {{ compressPendingFolders.length }} 个剧目 · 已完成记录 {{ autoDone.length }}
+            <template v-if="lastScanAt"> · 上次扫描 {{ lastScanAt }}</template>
+            <template v-if="autoEnabled"> · 下次扫描 {{ formatCountdown(nextScanIn) }}</template>
+          </template>
         </p>
         <div class="action-row">
           <p class="hint">
