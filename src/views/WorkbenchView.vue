@@ -37,6 +37,7 @@ import {
 } from '../taskStore'
 import {
   assertUniqueOutputPaths,
+  ensureMp4Extension,
   formatSize,
   isVideoFileName,
   makeId,
@@ -362,7 +363,8 @@ async function startMerge(normalizeResolution: boolean) {
   }
 
   isBusy.value = true
-  const outName = outputName.value.trim()
+  const outName = ensureMp4Extension(outputName.value)
+  outputName.value = outName
   const inputPaths = items.value.map((i) => i.path)
   const outputDir = outputPath.value
   let aborted = false

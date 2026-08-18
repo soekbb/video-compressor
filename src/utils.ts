@@ -12,6 +12,14 @@ export function toBatchName(name: string) {
   return `${name.slice(0, dot)}_batch${name.slice(dot)}`
 }
 
+/** 合成输出文件名未以 .mp4 结尾时自动补全（大小写不敏感）。 */
+export function ensureMp4Extension(name: string) {
+  const trimmed = name.trim()
+  if (!trimmed) return trimmed
+  if (/\.mp4$/i.test(trimmed)) return trimmed
+  return `${trimmed}.mp4`
+}
+
 export function toOutputPath(outputDir: string, outputName: string) {
   const separator = outputDir.includes('\\') && !outputDir.includes('/') ? '\\' : '/'
   const cleanName = outputName.replace(/^[\\/]+/, '')

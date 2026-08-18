@@ -649,6 +649,17 @@ fn escape_concat_path(path: &str) -> String {
   path.replace('\\', "/").replace('\'', "'\\''")
 }
 
+fn ensure_mp4_extension(name: &str) -> String {
+  let trimmed = name.trim();
+  if trimmed.is_empty() {
+    return trimmed.to_string();
+  }
+  if trimmed.len() >= 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".mp4") {
+    return trimmed.to_string();
+  }
+  format!("{trimmed}.mp4")
+}
+
 #[tauri::command]
 pub async fn merge_videos(
   app: AppHandle,
@@ -670,6 +681,7 @@ pub async fn merge_videos(
     fs::create_dir_all(&output_dir_path).map_err(|e| format!("无法创建输出目录：{e}"))?;
   }
 
+  let output_name = ensure_mp4_extension(&output_name);
   let output_path = output_dir_path.join(&output_name);
   let ffmpeg = resolve_bin(&app, "ffmpeg")?;
   let ffprobe = resolve_bin(&app, "ffprobe")?;

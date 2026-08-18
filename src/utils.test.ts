@@ -4,9 +4,18 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   assertUniqueOutputPaths,
+  ensureMp4Extension,
   runBatchCompressionItem,
   type BatchCompressionItem,
 } from './utils.ts'
+
+test('ensureMp4Extension appends .mp4 when missing', () => {
+  assert.equal(ensureMp4Extension('大小姐回归，三个哥哥求原谅-法语'), '大小姐回归，三个哥哥求原谅-法语.mp4')
+  assert.equal(ensureMp4Extension('合集_merge.mp4'), '合集_merge.mp4')
+  assert.equal(ensureMp4Extension('Clip.MP4'), 'Clip.MP4')
+  assert.equal(ensureMp4Extension('  title  '), 'title.mp4')
+  assert.equal(ensureMp4Extension(''), '')
+})
 
 const item: BatchCompressionItem = {
   inputPath: '/inputs/clip.mp4',
