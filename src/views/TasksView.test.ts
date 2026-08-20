@@ -31,6 +31,31 @@ afterEach(() => {
   tasks.value = []
 })
 
+describe('task status filter', () => {
+  it('shows only error tasks when the failed filter is selected', async () => {
+    tasks.value = [
+      makeTask('done', '完成批次', 'done', { videoCount: 1, doneCount: 1 }),
+      makeTask('error', '失败批次', 'error', { videoCount: 1, doneCount: 0 }, '编码失败'),
+      makeTask('cancelled', '取消批次', 'cancelled', { videoCount: 1, doneCount: 0 }, '用户取消'),
+      makeTask('running', '进行中批次', 'running', { videoCount: 1, doneCount: 0 }),
+    ]
+
+    const wrapper = mount(TasksView)
+    const failedChip = wrapper.findAll('.filter-chip').find((button) => button.text().includes('失败'))
+    expect(failedChip).toBeTruthy()
+    expect(failedChip!.text()).toContain('1')
+
+    await failedChip!.trigger('click')
+
+    expect(wrapper.findAll('.task-item')).toHaveLength(1)
+    expect(wrapper.text()).toContain('失败批次')
+    expect(wrapper.text()).toContain('编码失败')
+    expect(wrapper.text()).not.toContain('完成批次')
+    expect(wrapper.text()).not.toContain('取消批次')
+    expect(wrapper.text()).not.toContain('进行中批次')
+  })
+})
+
 describe('task failure details', () => {
   it('keeps every failed input hidden until the failed task is expanded', async () => {
     tasks.value = [

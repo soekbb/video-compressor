@@ -19,7 +19,7 @@ import {
   type TaskStatus,
 } from '../taskStore'
 
-type StatusFilter = 'all' | 'active' | 'ended'
+type StatusFilter = 'all' | 'active' | 'ended' | 'failed'
 
 const statusFilter = ref<StatusFilter>('all')
 const expandedFailureIds = ref(new Set<string>())
@@ -29,6 +29,7 @@ const filters: { id: StatusFilter; label: string }[] = [
   { id: 'all', label: '全部' },
   { id: 'active', label: '进行中' },
   { id: 'ended', label: '已结束' },
+  { id: 'failed', label: '失败' },
 ]
 
 function isActive(status: TaskStatus) {
@@ -39,23 +40,31 @@ function isEnded(status: TaskStatus) {
   return status === 'done' || status === 'error' || status === 'cancelled'
 }
 
+function isFailed(status: TaskStatus) {
+  return status === 'error'
+}
+
 const filteredTasks = computed(() => {
   if (statusFilter.value === 'all') return tasks.value
   if (statusFilter.value === 'active') return tasks.value.filter((t) => isActive(t.status))
+  if (statusFilter.value === 'failed') return tasks.value.filter((t) => isFailed(t.status))
   return tasks.value.filter((t) => isEnded(t.status))
 })
 
 const filterCounts = computed(() => {
   let active = 0
   let ended = 0
+  let failed = 0
   for (const t of tasks.value) {
     if (isActive(t.status)) active += 1
     else if (isEnded(t.status)) ended += 1
+    if (isFailed(t.status)) failed += 1
   }
   return {
     all: tasks.value.length,
     active,
     ended,
+    failed,
   }
 })
 
