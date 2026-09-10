@@ -74,6 +74,7 @@ fn even_dim(n: u32) -> u32 {
 }
 
 /// 用于判断 concat 是否可 stream copy（参数不一致则必须重编码）。
+/// 帧率/time_base 必须计入：copy 拼接时 timescale 不同会导致画面卡住、声音继续。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StreamFingerprint {
   width: u32,
@@ -81,6 +82,8 @@ struct StreamFingerprint {
   video_codec: String,
   pix_fmt: String,
   video_profile: String,
+  r_frame_rate: String,
+  time_base: String,
   has_audio: bool,
   audio_codec: String,
   sample_rate: String,
@@ -145,7 +148,7 @@ fn probe_stream_fingerprint(ffprobe: &Path, input: &Path) -> Result<StreamFinger
     ffprobe,
     input,
     "v:0",
-    "stream=codec_name,width,height,pix_fmt,profile",
+    "stream=codec_name,width,height,pix_fmt,profile,r_frame_rate,time_base",
   )
   .ok_or_else(|| format!("无法读取视频流：{}", input.display()))?;
 
@@ -160,6 +163,8 @@ fn probe_stream_fingerprint(ffprobe: &Path, input: &Path) -> Result<StreamFinger
     .ok_or_else(|| format!("无法读取高度：{}", input.display()))?;
   let pix_fmt = map_get_lc(&video, "pix_fmt");
   let video_profile = map_get_lc(&video, "profile");
+  let r_frame_rate = map_get_lc(&video, "r_frame_rate");
+  let time_base = map_get_lc(&video, "time_base");
 
   if video_codec.is_empty() || width == 0 || height == 0 {
     return Err(format!("视频流无效：{}", input.display()));
@@ -194,6 +199,8 @@ fn probe_stream_fingerprint(ffprobe: &Path, input: &Path) -> Result<StreamFinger
     video_codec,
     pix_fmt,
     video_profile,
+    r_frame_rate,
+    time_base,
     has_audio,
     audio_codec,
     sample_rate,
@@ -219,6 +226,10 @@ fn can_copy_video(fingerprints: &[StreamFingerprint]) -> bool {
       && fp.video_codec == first.video_codec
       && fp.pix_fmt == first.pix_fmt
       && fp.video_profile == first.video_profile
+      && !fp.r_frame_rate.is_empty()
+      && fp.r_frame_rate == first.r_frame_rate
+      && !fp.time_base.is_empty()
+      && fp.time_base == first.time_base
   })
 }
 
@@ -232,20 +243,41 @@ enum ConcatStrategy {
   FullReencode,
 }
 
-/// 将各片段缩放到同一分辨率后 concat（用于分辨率不一致时）。
+/// concat demuxer 在 timebase/帧率不一致时会压扁视频时间戳；重编码也必须走 filter concat。
+fn uses_filter_concat(mismatched: bool, strategy: ConcatStrategy) -> bool {
+  mismatched || strategy == ConcatStrategy::FullReencode
+}
+
+fn fps_filter_arg(r_frame_rate: &str) -> String {
+  let s = r_frame_rate.trim();
+  if !s.is_empty()
+    && s.chars().all(|c| c.is_ascii_digit() || c == '/')
+    && s.chars().any(|c| c.is_ascii_digit())
+    && !s.starts_with('/')
+    && !s.ends_with('/')
+  {
+    s.to_string()
+  } else {
+    "25".to_string()
+  }
+}
+
+/// 将各片段统一分辨率/帧率并重置时间戳后 concat。
 fn build_normalize_filter(
   count: usize,
   width: u32,
   height: u32,
   has_audio: &[bool],
   durations: &[f64],
+  fps: &str,
 ) -> (String, bool) {
   let any_audio = has_audio.iter().any(|v| *v);
   let mut parts: Vec<String> = Vec::new();
+  let fps = fps_filter_arg(fps);
 
   for i in 0..count {
     parts.push(format!(
-      "[{i}:v]scale={width}:{height}:flags=bicubic,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v{i}]"
+      "[{i}:v]scale={width}:{height}:flags=bicubic,setsar=1,format=yuv420p,setpts=PTS-STARTPTS,fps={fps}[v{i}]"
     ));
     if any_audio {
       if has_audio.get(i).copied().unwrap_or(false) {
@@ -720,7 +752,6 @@ pub async fn merge_videos(
   let video_copy_ok = !mismatched && can_copy_video(&fingerprints);
   let full_copy_ok = video_copy_ok && can_stream_copy(&fingerprints);
   let all_have_audio = !has_audio.is_empty() && has_audio.iter().all(|v| *v);
-  let none_have_audio = has_audio.iter().all(|v| !*v);
   let cancel = Arc::clone(&state);
   let cancel_key = cancel_key.unwrap_or_else(|| id.clone());
   let app_for_progress = app.clone();
@@ -728,6 +759,12 @@ pub async fn merge_videos(
   let output_path_clone = output_path.clone();
   let ffprobe_for_check = ffprobe.clone();
   let preset = quality_preset.unwrap_or_else(|| "size".into());
+  let fps_arg = fps_filter_arg(
+    fingerprints
+      .first()
+      .map(|fp| fp.r_frame_rate.as_str())
+      .unwrap_or(""),
+  );
   let input_paths_clone = input_paths.clone();
 
   let result = tauri::async_runtime::spawn_blocking(move || {
@@ -749,16 +786,18 @@ pub async fn merge_videos(
       cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
       let mut map_audio = true;
 
-      if mismatched {
+      if uses_filter_concat(mismatched, strategy) {
         for path in &input_paths_clone {
           cmd.arg("-i").arg(path);
         }
+        let encode_wh = if mismatched { target_wh } else { first_wh };
         let (filter, with_audio) = build_normalize_filter(
           input_paths_clone.len(),
-          target_wh.0,
-          target_wh.1,
+          encode_wh.0,
+          encode_wh.1,
           &has_audio,
           &durations,
+          &fps_arg,
         );
         cmd.args(["-filter_complex", &filter, "-map", "[outv]"]);
         if with_audio {
@@ -766,7 +805,7 @@ pub async fn merge_videos(
         } else {
           map_audio = false;
         }
-        append_video_encode_args(&mut cmd, encoder, &preset, target_wh.0, target_wh.1);
+        append_video_encode_args(&mut cmd, encoder, &preset, encode_wh.0, encode_wh.1);
         if map_audio {
           append_audio_aac_args(&mut cmd, &preset);
         }
@@ -789,18 +828,7 @@ pub async fn merge_videos(
             append_audio_aac_unified_args(&mut cmd, &preset);
           }
           ConcatStrategy::FullReencode => {
-            append_video_encode_args(
-              &mut cmd,
-              encoder,
-              &preset,
-              first_wh.0,
-              first_wh.1,
-            );
-            if none_have_audio {
-              cmd.arg("-an");
-            } else {
-              append_audio_aac_unified_args(&mut cmd, &preset);
-            }
+            return Err("内部错误：重编码应走 filter concat".into());
           }
         }
       }
@@ -970,6 +998,33 @@ mod tests {
   use std::fs;
   use std::time::{SystemTime, UNIX_EPOCH};
 
+  #[cfg(unix)]
+  use std::os::unix::fs::PermissionsExt;
+
+  #[cfg(unix)]
+  fn fake_ffprobe(video_stdout: &str, audio_stdout: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+      "video-compressor-fingerprint-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let ffprobe = dir.join("ffprobe");
+    let script = format!(
+      "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    v:0) printf '%s\\n' '{video}'\n         exit 0 ;;\n    a:0) printf '%s\\n' '{audio}'\n         exit 0 ;;\n  esac\ndone\nexit 1\n",
+      video = video_stdout.replace('\'', "'\\''"),
+      audio = audio_stdout.replace('\'', "'\\''"),
+    );
+    fs::write(&ffprobe, script).unwrap();
+    let mut permissions = fs::metadata(&ffprobe).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ffprobe, permissions).unwrap();
+    (dir, ffprobe)
+  }
+
   #[test]
   fn skips_temp_and_hidden_video_names() {
     assert!(should_skip_video_name(".影工临时_01_abcd.mp4"));
@@ -1112,5 +1167,109 @@ mod tests {
     assert_eq!(last.videos_found, 2);
 
     let _ = fs::remove_dir_all(&root);
+  }
+
+  fn fingerprint(r_frame_rate: &str, time_base: &str) -> StreamFingerprint {
+    StreamFingerprint {
+      width: 1080,
+      height: 1920,
+      video_codec: "h264".into(),
+      pix_fmt: "yuv420p".into(),
+      video_profile: "high".into(),
+      r_frame_rate: r_frame_rate.into(),
+      time_base: time_base.into(),
+      has_audio: true,
+      audio_codec: "aac".into(),
+      sample_rate: "48000".into(),
+      channels: "2".into(),
+    }
+  }
+
+  #[test]
+  fn can_copy_video_rejects_mismatched_frame_rate() {
+    let a = fingerprint("25/1", "1/12800");
+    let b = fingerprint("24/1", "1/12800");
+    assert!(
+      !can_copy_video(&[a, b]),
+      "24fps mixed with 25fps must re-encode"
+    );
+  }
+
+  #[test]
+  fn can_copy_video_rejects_mismatched_time_base() {
+    let a = fingerprint("25/1", "1/12800");
+    let b = fingerprint("25/1", "1/12288");
+    assert!(
+      !can_copy_video(&[a, b]),
+      "different time_base must re-encode"
+    );
+  }
+
+  #[test]
+  fn can_copy_video_rejects_empty_timing() {
+    let a = fingerprint("", "");
+    let b = fingerprint("", "");
+    assert!(
+      !can_copy_video(&[a, b]),
+      "missing fps/time_base must not stream-copy"
+    );
+  }
+
+  #[test]
+  fn can_copy_video_allows_matching_timing() {
+    let a = fingerprint("25/1", "1/12800");
+    let b = fingerprint("25/1", "1/12800");
+    assert!(can_copy_video(&[a, b]));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn probe_stream_fingerprint_reads_frame_rate_and_time_base() {
+    let video = [
+      "codec_name=h264",
+      "width=1080",
+      "height=1920",
+      "pix_fmt=yuv420p",
+      "profile=High",
+      "r_frame_rate=24/1",
+      "time_base=1/12288",
+    ]
+    .join("\n");
+    let audio = ["codec_name=aac", "sample_rate=48000", "channels=2"].join("\n");
+    let (dir, ffprobe) = fake_ffprobe(&video, &audio);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, [1]).unwrap();
+
+    let fp = probe_stream_fingerprint(&ffprobe, &input).unwrap();
+    assert_eq!(fp.r_frame_rate, "24/1");
+    assert_eq!(fp.time_base, "1/12288");
+    assert_eq!(fp.width, 1080);
+    assert_eq!(fp.height, 1920);
+
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn filter_concat_used_when_full_reencode_even_if_resolution_matches() {
+    assert!(uses_filter_concat(false, ConcatStrategy::FullReencode));
+    assert!(!uses_filter_concat(false, ConcatStrategy::FullCopy));
+    assert!(!uses_filter_concat(
+      false,
+      ConcatStrategy::VideoCopyAudioEncode
+    ));
+    assert!(uses_filter_concat(true, ConcatStrategy::FullReencode));
+  }
+
+  #[test]
+  fn normalize_filter_unifies_fps_and_resets_timestamps() {
+    let (filter, has_audio) =
+      build_normalize_filter(2, 1080, 1920, &[true, true], &[1.0, 1.0], "25/1");
+    assert!(has_audio);
+    assert!(
+      filter.contains("fps=25/1"),
+      "expected fps unification, got {filter}"
+    );
+    assert!(filter.contains("setpts=PTS-STARTPTS"));
+    assert!(filter.contains("concat=n=2:v=1:a=1"));
   }
 }

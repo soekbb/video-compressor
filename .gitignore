@@ -36,3 +36,6 @@ src-tauri/icons/android
 *.sln
 *.sw?
 .worktrees/
+
+# 本地临时视频与合成缓存，不入库、pull 时忽略
+tmp/
