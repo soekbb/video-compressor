@@ -233,6 +233,49 @@ fn can_copy_video(fingerprints: &[StreamFingerprint]) -> bool {
   })
 }
 
+fn video_compat_tuple(
+  fp: &StreamFingerprint,
+) -> (&u32, &u32, &str, &str, &str, &str, &str) {
+  (
+    &fp.width,
+    &fp.height,
+    fp.video_codec.as_str(),
+    fp.pix_fmt.as_str(),
+    fp.video_profile.as_str(),
+    fp.r_frame_rate.as_str(),
+    fp.time_base.as_str(),
+  )
+}
+
+fn majority_video_target_index(fingerprints: &[StreamFingerprint]) -> usize {
+  let mut best_index = 0;
+  let mut best_count = 0;
+  for (i, fp) in fingerprints.iter().enumerate() {
+    let count = fingerprints
+      .iter()
+      .filter(|other| video_compat_tuple(other) == video_compat_tuple(fp))
+      .count();
+    if count > best_count {
+      best_count = count;
+      best_index = i;
+    }
+  }
+  best_index
+}
+
+fn indices_needing_video_normalize(fingerprints: &[StreamFingerprint]) -> Vec<usize> {
+  if fingerprints.is_empty() {
+    return Vec::new();
+  }
+  let target = &fingerprints[majority_video_target_index(fingerprints)];
+  fingerprints
+    .iter()
+    .enumerate()
+    .filter(|(_, fp)| !can_copy_video(&[target.clone(), (*fp).clone()]))
+    .map(|(i, _)| i)
+    .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConcatStrategy {
   /// 音视频全部 copy
@@ -1183,6 +1226,38 @@ mod tests {
       sample_rate: "48000".into(),
       channels: "2".into(),
     }
+  }
+
+  #[test]
+  fn majority_target_ignores_leading_minority_fps() {
+    let fps24 = fingerprint("24/1", "1/12288");
+    let fps25 = fingerprint("25/1", "1/12800");
+    let list = vec![
+      fps24.clone(),
+      fps25.clone(),
+      fps25.clone(),
+      fps25.clone(),
+      fps25.clone(),
+    ];
+    assert_eq!(majority_video_target_index(&list), 1);
+    assert_eq!(indices_needing_video_normalize(&list), vec![0]);
+  }
+
+  #[test]
+  fn majority_target_tie_uses_lower_index() {
+    let a = fingerprint("25/1", "1/12800");
+    let b = fingerprint("24/1", "1/12288");
+    let list = vec![a, b];
+    assert_eq!(majority_video_target_index(&list), 0);
+    assert_eq!(indices_needing_video_normalize(&list), vec![1]);
+  }
+
+  #[test]
+  fn majority_target_all_matching_needs_no_normalize() {
+    let a = fingerprint("25/1", "1/12800");
+    let list = vec![a.clone(), a.clone(), a];
+    assert_eq!(majority_video_target_index(&list), 0);
+    assert!(indices_needing_video_normalize(&list).is_empty());
   }
 
   #[test]
