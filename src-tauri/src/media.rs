@@ -297,11 +297,37 @@ enum ConcatStrategy {
   VideoCopyAudioEncode,
   /// 全量重编码（硬编优先）
   FullReencode,
+  /// 只转与多数派不一致的分集，再 demuxer copy
+  NormalizeThenCopy,
 }
 
 /// concat demuxer 在 timebase/帧率不一致时会压扁视频时间戳；重编码也必须走 filter concat。
 fn uses_filter_concat(mismatched: bool, strategy: ConcatStrategy) -> bool {
   mismatched || strategy == ConcatStrategy::FullReencode
+}
+
+fn concat_strategies(
+  resolution_mismatched: bool,
+  full_copy_ok: bool,
+  video_copy_ok: bool,
+  all_have_audio: bool,
+  needs_video_normalize: bool,
+) -> Vec<ConcatStrategy> {
+  if resolution_mismatched {
+    return vec![ConcatStrategy::FullReencode];
+  }
+  let mut strategies = Vec::new();
+  if full_copy_ok {
+    strategies.push(ConcatStrategy::FullCopy);
+  }
+  if all_have_audio && video_copy_ok {
+    strategies.push(ConcatStrategy::VideoCopyAudioEncode);
+  }
+  if needs_video_normalize {
+    strategies.push(ConcatStrategy::NormalizeThenCopy);
+  }
+  strategies.push(ConcatStrategy::FullReencode);
+  strategies
 }
 
 fn fps_filter_arg(r_frame_rate: &str) -> String {
@@ -883,6 +909,9 @@ pub async fn merge_videos(
             cmd.args(["-c:v", "copy"]);
             append_audio_aac_unified_args(&mut cmd, &preset);
           }
+          ConcatStrategy::NormalizeThenCopy => {
+            return Err("内部错误：NormalizeThenCopy 未实现".into());
+          }
           ConcatStrategy::FullReencode => {
             return Err("内部错误：重编码应走 filter concat".into());
           }
@@ -966,19 +995,15 @@ pub async fn merge_videos(
       );
     };
 
-    let mut strategies: Vec<ConcatStrategy> = Vec::new();
-    if mismatched {
-      strategies.push(ConcatStrategy::FullReencode);
-    } else {
-      if full_copy_ok {
-        strategies.push(ConcatStrategy::FullCopy);
-      }
-      // 视频一致、音频不一致；或全 copy 失败后再试「视频 copy + 转音频」
-      if all_have_audio && video_copy_ok {
-        strategies.push(ConcatStrategy::VideoCopyAudioEncode);
-      }
-      strategies.push(ConcatStrategy::FullReencode);
-    }
+    let needs_video_normalize =
+      !mismatched && !indices_needing_video_normalize(&fingerprints).is_empty();
+    let strategies = concat_strategies(
+      mismatched,
+      full_copy_ok,
+      video_copy_ok,
+      all_have_audio,
+      needs_video_normalize,
+    );
 
     let mut last_err = String::from("合成失败");
     let mut done = false;
@@ -988,7 +1013,9 @@ pub async fn merge_videos(
       }
 
       let encoders = match strategy {
-        ConcatStrategy::FullCopy | ConcatStrategy::VideoCopyAudioEncode => {
+        ConcatStrategy::FullCopy
+        | ConcatStrategy::VideoCopyAudioEncode
+        | ConcatStrategy::NormalizeThenCopy => {
           vec![VideoEncoderKind::X264] // 占位，copy 路径不使用
         }
         ConcatStrategy::FullReencode => encoder_fallback_chain(&ffmpeg),
@@ -1351,6 +1378,43 @@ mod tests {
     assert_eq!(fp.height, 1920);
 
     fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn concat_strategies_inserts_normalize_before_full_reencode() {
+    let got = concat_strategies(false, false, false, true, true);
+    assert_eq!(
+      got,
+      vec![
+        ConcatStrategy::NormalizeThenCopy,
+        ConcatStrategy::FullReencode
+      ]
+    );
+  }
+
+  #[test]
+  fn concat_strategies_skips_normalize_when_copy_ok() {
+    let got = concat_strategies(false, true, true, true, false);
+    assert_eq!(
+      got,
+      vec![
+        ConcatStrategy::FullCopy,
+        ConcatStrategy::VideoCopyAudioEncode,
+        ConcatStrategy::FullReencode
+      ]
+    );
+  }
+
+  #[test]
+  fn concat_strategies_resolution_mismatch_only_reencodes() {
+    let got = concat_strategies(true, false, false, true, true);
+    assert_eq!(got, vec![ConcatStrategy::FullReencode]);
+  }
+
+  #[test]
+  fn filter_concat_not_used_for_normalize_then_copy() {
+    assert!(!uses_filter_concat(false, ConcatStrategy::NormalizeThenCopy));
+    assert!(uses_filter_concat(false, ConcatStrategy::FullReencode));
   }
 
   #[test]
