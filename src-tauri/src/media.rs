@@ -276,6 +276,19 @@ fn indices_needing_video_normalize(fingerprints: &[StreamFingerprint]) -> Vec<us
     .collect()
 }
 
+fn mp4_timescale(time_base: &str) -> Option<u32> {
+  let (num, den) = time_base.trim().split_once('/')?;
+  if num != "1" {
+    return None;
+  }
+  let n: u32 = den.parse().ok()?;
+  if n == 0 {
+    None
+  } else {
+    Some(n)
+  }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConcatStrategy {
   /// 音视频全部 copy
@@ -1258,6 +1271,22 @@ mod tests {
     let list = vec![a.clone(), a.clone(), a];
     assert_eq!(majority_video_target_index(&list), 0);
     assert!(indices_needing_video_normalize(&list).is_empty());
+  }
+
+  #[test]
+  fn mp4_timescale_parses_one_over_n() {
+    assert_eq!(mp4_timescale("1/12800"), Some(12800));
+    assert_eq!(mp4_timescale("1/12288"), Some(12288));
+    assert_eq!(mp4_timescale("1/12800"), Some(12800));
+  }
+
+  #[test]
+  fn mp4_timescale_rejects_unusable_values() {
+    assert_eq!(mp4_timescale(""), None);
+    assert_eq!(mp4_timescale("1/0"), None);
+    assert_eq!(mp4_timescale("2/12800"), None);
+    assert_eq!(mp4_timescale("12800"), None);
+    assert_eq!(mp4_timescale("n/a"), None);
   }
 
   #[test]
