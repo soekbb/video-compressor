@@ -352,6 +352,41 @@ fn normalize_temp_path(task_id: &str, index: usize) -> PathBuf {
   std::env::temp_dir().join(format!("kuaiya-norm-{task_id}-{index}.mp4"))
 }
 
+fn normalize_phase_progress(done_secs: f64, total_secs: f64) -> u32 {
+  if total_secs <= 0.0 {
+    return 90;
+  }
+  let ratio = (done_secs / total_secs).clamp(0.0, 1.0);
+  (ratio * 90.0).floor() as u32
+}
+
+fn audio_params_match(a: &StreamFingerprint, b: &StreamFingerprint) -> bool {
+  a.has_audio == b.has_audio
+    && a.audio_codec == b.audio_codec
+    && a.sample_rate == b.sample_rate
+    && a.channels == b.channels
+}
+
+struct NormalizeTemps(Vec<PathBuf>);
+
+impl NormalizeTemps {
+  fn new() -> Self {
+    Self(Vec::new())
+  }
+
+  fn push(&mut self, path: PathBuf) {
+    self.0.push(path);
+  }
+}
+
+impl Drop for NormalizeTemps {
+  fn drop(&mut self) {
+    for path in &self.0 {
+      let _ = fs::remove_file(path);
+    }
+  }
+}
+
 /// 将各片段统一分辨率/帧率并重置时间戳后 concat。
 fn build_normalize_filter(
   count: usize,
@@ -856,14 +891,16 @@ pub async fn merge_videos(
       .unwrap_or(""),
   );
   let input_paths_clone = input_paths.clone();
+  let needs_video_normalize =
+    !mismatched && !indices_needing_video_normalize(&fingerprints).is_empty();
 
   let result = tauri::async_runtime::spawn_blocking(move || {
     let list_path = std::env::temp_dir().join(format!("kuaiya-concat-{id}.txt"));
 
-    let write_concat_list = || -> Result<(), String> {
+    let write_concat_list = |paths: &[String]| -> Result<(), String> {
       let mut file =
         fs::File::create(&list_path).map_err(|e| format!("无法创建合成列表：{e}"))?;
-      for path in &input_paths_clone {
+      for path in paths {
         writeln!(file, "file '{}'", escape_concat_path(path))
           .map_err(|e| format!("写入合成列表失败：{e}"))?;
       }
@@ -871,6 +908,8 @@ pub async fn merge_videos(
     };
 
     let run_once = |strategy: ConcatStrategy, encoder: VideoEncoderKind| -> Result<(), String> {
+      let mut temps = NormalizeTemps::new();
+      let mut concat_progress_from = 0_u32;
       let mut cmd = Command::new(&ffmpeg);
       configure_subprocess(&mut cmd);
       cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
@@ -900,15 +939,125 @@ pub async fn merge_videos(
           append_audio_aac_args(&mut cmd, &preset);
         }
       } else {
-        write_concat_list()?;
-        cmd.args([
-          "-f",
-          "concat",
-          "-safe",
-          "0",
-          "-i",
-          list_path.to_string_lossy().as_ref(),
-        ]);
+        let mut concat_paths = input_paths_clone.clone();
+        let audio_copy_all = match strategy {
+          ConcatStrategy::FullCopy | ConcatStrategy::VideoCopyAudioEncode => false,
+          ConcatStrategy::NormalizeThenCopy => {
+            if fingerprints.is_empty() {
+              return Err("内部错误：无视频指纹".into());
+            }
+            let target_i = majority_video_target_index(&fingerprints);
+            let target = fingerprints[target_i].clone();
+            let timescale = mp4_timescale(&target.time_base)
+              .ok_or_else(|| format!("无法解析 time_base：{}", target.time_base))?;
+            let timescale_arg = timescale.to_string();
+            let need = indices_needing_video_normalize(&fingerprints);
+            let mut effective = fingerprints.clone();
+            let mut done_secs = 0.0_f64;
+            let mut last_norm_progress = 0_u32;
+            for i in need {
+              if cancel.is_cancelled(&cancel_key) {
+                return Err("已取消合成".into());
+              }
+              let input = &input_paths_clone[i];
+              let fp = &fingerprints[i];
+              let temp = normalize_temp_path(&id, i);
+              temps.push(temp.clone());
+
+              let mut ncmd = Command::new(&ffmpeg);
+              configure_subprocess(&mut ncmd);
+              ncmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+              ncmd.arg("-i").arg(input);
+              ncmd.args(["-map", "0:v:0"]);
+              if fp.has_audio {
+                ncmd.args(["-map", "0:a:0?"]);
+              }
+              let vf = normalize_clip_vf(&target.r_frame_rate);
+              ncmd.args(["-vf", &vf]);
+              append_video_encode_args(
+                &mut ncmd,
+                VideoEncoderKind::X264,
+                &preset,
+                target.width,
+                target.height,
+              );
+              ncmd.args(["-bf", "0", "-video_track_timescale", &timescale_arg]);
+              if fp.has_audio {
+                if audio_params_match(fp, &target) {
+                  ncmd.args(["-c:a", "copy"]);
+                } else {
+                  append_audio_aac_unified_args(&mut ncmd, &preset);
+                }
+              }
+              ncmd.args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"]);
+              ncmd.arg(&temp);
+
+              let mut child = ncmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("启动 FFmpeg 规范化失败：{e}"))?;
+              let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "无法读取进度".to_string())?;
+              let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "无法读取错误输出".to_string())?;
+              let stderr_worker = spawn_stderr_collector(stderr);
+              let reader = BufReader::new(stdout);
+              for line in reader.lines().flatten() {
+                if cancel.is_cancelled(&cancel_key) {
+                  let _ = child.kill();
+                  let _ = stderr_worker.join();
+                  return Err("已取消合成".into());
+                }
+                if let Some(out_secs) = parse_out_time_secs(&line) {
+                  let progress =
+                    normalize_phase_progress(done_secs + out_secs, total_duration);
+                  if progress > last_norm_progress {
+                    last_norm_progress = progress;
+                    let _ = app_for_progress.emit(
+                      "merge-progress",
+                      MergeProgressPayload {
+                        id: id_for_progress.clone(),
+                        progress,
+                      },
+                    );
+                  }
+                }
+              }
+              let status = child
+                .wait()
+                .map_err(|e| format!("等待规范化结束失败：{e}"))?;
+              let err_buf = stderr_worker.join().unwrap_or_default();
+              if !status.success() {
+                let detail = err_buf
+                  .lines()
+                  .rev()
+                  .find(|l| !l.trim().is_empty())
+                  .unwrap_or("规范化失败");
+                return Err(format!("规范化失败：{detail}"));
+              }
+              let probed = probe_stream_fingerprint(&ffprobe_for_check, &temp)?;
+              if !can_copy_video(&[target.clone(), probed.clone()]) {
+                return Err("规范化后视频参数仍不一致".into());
+              }
+              concat_paths[i] = temp.to_string_lossy().into_owned();
+              effective[i] = probed;
+              done_secs += durations.get(i).copied().unwrap_or(0.0);
+            }
+            concat_progress_from = 90;
+            effective.iter().all(|fp| audio_params_match(fp, &target))
+          }
+          ConcatStrategy::FullReencode => {
+            return Err("内部错误：重编码应走 filter concat".into());
+          }
+        };
+        write_concat_list(&concat_paths)?;
+        let list_arg = list_path.to_string_lossy();
+        cmd.args(["-f", "concat", "-safe", "0", "-i", list_arg.as_ref()]);
         match strategy {
           ConcatStrategy::FullCopy => {
             cmd.args(["-c", "copy"]);
@@ -918,7 +1067,12 @@ pub async fn merge_videos(
             append_audio_aac_unified_args(&mut cmd, &preset);
           }
           ConcatStrategy::NormalizeThenCopy => {
-            return Err("内部错误：NormalizeThenCopy 未实现".into());
+            if audio_copy_all {
+              cmd.args(["-c", "copy"]);
+            } else {
+              cmd.args(["-c:v", "copy"]);
+              append_audio_aac_unified_args(&mut cmd, &preset);
+            }
           }
           ConcatStrategy::FullReencode => {
             return Err("内部错误：重编码应走 filter concat".into());
@@ -956,7 +1110,16 @@ pub async fn merge_videos(
           return Err("已取消合成".into());
         }
         if let Some(out_secs) = parse_out_time_secs(&line) {
-          let progress = if total_duration > 0.0 {
+          let progress = if concat_progress_from >= 90 {
+            if total_duration > 0.0 {
+              (90 + (((out_secs / total_duration).clamp(0.0, 1.0) * 9.0).floor() as u32))
+                .min(99)
+            } else if last_progress < 99 {
+              last_progress.max(90) + 1
+            } else {
+              last_progress
+            }
+          } else if total_duration > 0.0 {
             (((out_secs / total_duration).clamp(0.0, 1.0) * 100.0).floor() as u32).min(99)
           } else if last_progress < 95 {
             last_progress + 1
@@ -1003,8 +1166,6 @@ pub async fn merge_videos(
       );
     };
 
-    let needs_video_normalize =
-      !mismatched && !indices_needing_video_normalize(&fingerprints).is_empty();
     let strategies = concat_strategies(
       mismatched,
       full_copy_ok,
@@ -1024,7 +1185,7 @@ pub async fn merge_videos(
         ConcatStrategy::FullCopy
         | ConcatStrategy::VideoCopyAudioEncode
         | ConcatStrategy::NormalizeThenCopy => {
-          vec![VideoEncoderKind::X264] // 占位，copy 路径不使用
+          vec![VideoEncoderKind::X264] // copy / normalize 只用软编
         }
         ConcatStrategy::FullReencode => encoder_fallback_chain(&ffmpeg),
       };
@@ -1461,5 +1622,13 @@ mod tests {
     let p = normalize_temp_path("abc", 3);
     let name = p.file_name().unwrap().to_string_lossy();
     assert_eq!(name, "kuaiya-norm-abc-3.mp4");
+  }
+
+  #[test]
+  fn normalize_phase_progress_maps_duration_to_90() {
+    assert_eq!(normalize_phase_progress(0.0, 10.0), 0);
+    assert_eq!(normalize_phase_progress(5.0, 10.0), 45);
+    assert_eq!(normalize_phase_progress(10.0, 10.0), 90);
+    assert_eq!(normalize_phase_progress(12.0, 10.0), 90);
   }
 }
