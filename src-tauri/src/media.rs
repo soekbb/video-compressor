@@ -344,6 +344,14 @@ fn fps_filter_arg(r_frame_rate: &str) -> String {
   }
 }
 
+fn normalize_clip_vf(target_fps: &str) -> String {
+  format!("setpts=PTS-STARTPTS,fps={}", fps_filter_arg(target_fps))
+}
+
+fn normalize_temp_path(task_id: &str, index: usize) -> PathBuf {
+  std::env::temp_dir().join(format!("kuaiya-norm-{task_id}-{index}.mp4"))
+}
+
 /// 将各片段统一分辨率/帧率并重置时间戳后 concat。
 fn build_normalize_filter(
   count: usize,
@@ -1439,5 +1447,19 @@ mod tests {
     );
     assert!(filter.contains("setpts=PTS-STARTPTS"));
     assert!(filter.contains("concat=n=2:v=1:a=1"));
+  }
+
+  #[test]
+  fn normalize_clip_vf_resets_pts_and_fps_without_scale() {
+    let vf = normalize_clip_vf("25/1");
+    assert_eq!(vf, "setpts=PTS-STARTPTS,fps=25/1");
+    assert!(!vf.contains("scale="));
+  }
+
+  #[test]
+  fn normalize_temp_path_includes_task_id_and_index() {
+    let p = normalize_temp_path("abc", 3);
+    let name = p.file_name().unwrap().to_string_lossy();
+    assert_eq!(name, "kuaiya-norm-abc-3.mp4");
   }
 }
