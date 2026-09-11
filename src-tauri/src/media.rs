@@ -952,6 +952,10 @@ pub async fn merge_videos(
               .ok_or_else(|| format!("无法解析 time_base：{}", target.time_base))?;
             let timescale_arg = timescale.to_string();
             let need = indices_needing_video_normalize(&fingerprints);
+            let need_total: f64 = need
+              .iter()
+              .map(|&i| durations.get(i).copied().unwrap_or(0.0))
+              .sum();
             let mut effective = fingerprints.clone();
             let mut done_secs = 0.0_f64;
             let mut last_norm_progress = 0_u32;
@@ -1015,7 +1019,7 @@ pub async fn merge_videos(
                 }
                 if let Some(out_secs) = parse_out_time_secs(&line) {
                   let progress =
-                    normalize_phase_progress(done_secs + out_secs, total_duration);
+                    normalize_phase_progress(done_secs + out_secs, need_total);
                   if progress > last_norm_progress {
                     last_norm_progress = progress;
                     let _ = app_for_progress.emit(
