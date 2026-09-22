@@ -13,6 +13,9 @@ use crate::encode::{
   append_audio_aac_args, append_audio_aac_unified_args, append_video_encode_args,
   encoder_fallback_chain, mark_hw_encoder_failed, VideoEncoderKind,
 };
+use crate::output_spec::{
+  letterbox_vf, majority_portrait, parse_resolution_preset, target_canvas, ResolutionPreset,
+};
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv"];
 
@@ -401,8 +404,9 @@ fn build_normalize_filter(
   let fps = fps_filter_arg(fps);
 
   for i in 0..count {
+    let vf = letterbox_vf(width, height);
     parts.push(format!(
-      "[{i}:v]scale={width}:{height}:flags=bicubic,setsar=1,format=yuv420p,setpts=PTS-STARTPTS,fps={fps}[v{i}]"
+      "[{i}:v]{vf},format=yuv420p,setpts=PTS-STARTPTS,fps={fps}[v{i}]"
     ));
     if any_audio {
       if has_audio.get(i).copied().unwrap_or(false) {
@@ -826,6 +830,7 @@ pub async fn merge_videos(
   output_dir: String,
   output_name: String,
   quality_preset: Option<String>,
+  merge_resolution: Option<String>,
   normalize_resolution: Option<bool>,
   cancel_key: Option<String>,
 ) -> Result<MergeResult, String> {
@@ -872,7 +877,20 @@ pub async fn merge_videos(
     ));
   }
 
-  let target_wh = (even_dim(first_wh.0), even_dim(first_wh.1));
+  let merge_preset = parse_resolution_preset(
+    merge_resolution.as_deref().unwrap_or("1080"),
+    ResolutionPreset::P1080,
+  );
+  let (target_w, target_h) = if mismatched {
+    if majority_portrait(&sizes) {
+      target_canvas(merge_preset, 9, 16)
+    } else {
+      target_canvas(merge_preset, 16, 9)
+    }
+  } else {
+    first_wh
+  };
+  let target_wh = (even_dim(target_w), even_dim(target_h));
   let assert_wh = if mismatched { target_wh } else { first_wh };
   let video_copy_ok = !mismatched && can_copy_video(&fingerprints);
   let full_copy_ok = video_copy_ok && can_stream_copy(&fingerprints);
@@ -1619,6 +1637,25 @@ mod tests {
     let vf = normalize_clip_vf("25/1");
     assert_eq!(vf, "setpts=PTS-STARTPTS,fps=25/1");
     assert!(!vf.contains("scale="));
+  }
+
+  #[test]
+  fn merge_mismatch_target_uses_settings_not_first_clip() {
+    use crate::output_spec::{majority_portrait, parse_resolution_preset, target_canvas, ResolutionPreset};
+    let sizes = [(1920, 1080), (1080, 1920), (1080, 1920)];
+    let portrait = majority_portrait(&sizes);
+    assert!(portrait);
+    let preset = parse_resolution_preset("1080", ResolutionPreset::P1080);
+    let dummy = if portrait { (9, 16) } else { (16, 9) };
+    assert_eq!(target_canvas(preset, dummy.0, dummy.1), (1080, 1920));
+  }
+
+  #[test]
+  fn normalize_filter_letterboxes_instead_of_stretch_scale() {
+    let (filter, _) =
+      build_normalize_filter(2, 720, 1280, &[true, true], &[1.0, 1.0], "25/1");
+    assert!(filter.contains("pad=720:1280:(ow-iw)/2:(oh-ih)/2"), "{filter}");
+    assert!(!filter.contains("scale=720:1280:flags=bicubic"), "{filter}");
   }
 
   #[test]
