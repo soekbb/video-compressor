@@ -147,6 +147,39 @@ pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), Stri
   Ok((width, height))
 }
 
+/// 读取视频流编码器名称（如 h264）。
+pub fn probe_video_codec(ffprobe: &Path, input: &Path) -> Result<String, String> {
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
+    .args([
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=codec_name",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      input.to_string_lossy().as_ref(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .map_err(|e| format!("探测编码器失败：{e}"))?;
+
+  if !output.status.success() {
+    return Err("无法读取视频编码器".into());
+  }
+
+  let name = String::from_utf8_lossy(&output.stdout);
+  let name = name.trim();
+  if name.is_empty() {
+    return Err("无法读取视频编码器".into());
+  }
+  Ok(name.to_string())
+}
+
 /// 校验输出与期望分辨率一致（压制/合成均须保持原分辨率）。
 pub fn assert_resolution(
   ffprobe: &Path,
@@ -368,6 +401,7 @@ pub async fn compress_video(
   output_dir: String,
   output_name: String,
   quality_preset: Option<String>,
+  target_resolution: Option<String>,
   // 任务级取消键；同一任务内并行视频共享，互不影响其它任务
   cancel_key: Option<String>,
 ) -> Result<CompressResult, String> {
@@ -398,6 +432,20 @@ pub async fn compress_video(
   let ffmpeg = resolve_bin(&app, "ffmpeg")?;
   let ffprobe = resolve_bin(&app, "ffprobe")?;
   let input_wh = probe_video_size(&ffprobe, &input)?;
+  use crate::output_spec::{
+    decide_compress, letterbox_vf, moov_is_before_mdat, parse_resolution_preset, target_canvas,
+    CompressAction, ResolutionPreset,
+  };
+
+  let preset_res = parse_resolution_preset(
+    target_resolution.as_deref().unwrap_or("720"),
+    ResolutionPreset::P720,
+  );
+  let target_wh = target_canvas(preset_res, input_wh.0, input_wh.1);
+  let codec = probe_video_codec(&ffprobe, &input)?;
+  let h264 = codec.eq_ignore_ascii_case("h264");
+  let moov_front = moov_is_before_mdat(&input);
+  let action = decide_compress(h264, input_wh.0, input_wh.1, target_wh.0, target_wh.1, moov_front);
   let duration = probe_duration_secs(&ffprobe, &input);
   let cancel = Arc::clone(&state);
   let cancel_key = cancel_key.unwrap_or_else(|| id.clone());
@@ -416,8 +464,178 @@ pub async fn compress_video(
     };
     use crate::replace::replace_file_force;
 
+    if action == CompressAction::Skip {
+      if inplace {
+        let output_size = fs::metadata(&input).map(|m| m.len()).unwrap_or(0);
+        let _ = app_for_progress.emit(
+          "compress-progress",
+          CompressProgressPayload {
+            id: id_for_progress,
+            progress: 100,
+          },
+        );
+        return Ok(CompressResult {
+          output_path: input.to_string_lossy().to_string(),
+          output_size,
+          encoder: "copy".into(),
+        });
+      }
+
+      fs::copy(&input, &final_path_clone).map_err(|e| format!("复制文件失败：{e}"))?;
+      assert_resolution(&ffprobe_for_check, &final_path_clone, target_wh)?;
+      let output_size = fs::metadata(&final_path_clone)
+        .map(|m| m.len())
+        .unwrap_or(0);
+      let _ = app_for_progress.emit(
+        "compress-progress",
+        CompressProgressPayload {
+          id: id_for_progress,
+          progress: 100,
+        },
+      );
+      return Ok(CompressResult {
+        output_path: final_path_clone.to_string_lossy().to_string(),
+        output_size,
+        encoder: "copy".into(),
+      });
+    }
+
+    if action == CompressAction::RemuxFaststart {
+      if cancel.is_cancelled(&cancel_key) {
+        let _ = fs::remove_file(&encode_path_clone);
+        return Err("已取消压缩".into());
+      }
+
+      let mut remux_cmd = Command::new(&ffmpeg);
+      configure_subprocess(&mut remux_cmd);
+      remux_cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        input.to_string_lossy().as_ref(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        encode_path_clone.to_string_lossy().as_ref(),
+      ]);
+
+      let remux_outcome = (|| -> Result<CompressResult, String> {
+        let mut child = remux_cmd
+          .stdout(Stdio::piped())
+          .stderr(Stdio::piped())
+          .spawn()
+          .map_err(|e| format!("启动 FFmpeg 失败：{e}"))?;
+
+        let stdout = child
+          .stdout
+          .take()
+          .ok_or_else(|| "无法读取 FFmpeg 进度输出".to_string())?;
+        let stderr = child
+          .stderr
+          .take()
+          .ok_or_else(|| "无法读取 FFmpeg 错误输出".to_string())?;
+        let stderr_worker = spawn_stderr_collector(stderr);
+
+        let reader = BufReader::new(stdout);
+        let mut last_progress = 0_u32;
+
+        for line in reader.lines().flatten() {
+          if cancel.is_cancelled(&cancel_key) {
+            let _ = child.kill();
+            let _ = stderr_worker.join();
+            let _ = fs::remove_file(&encode_path_clone);
+            return Err("已取消压缩".into());
+          }
+
+          if let Some(out_secs) = parse_out_time_secs(&line) {
+            let progress = match duration {
+              Some(total) if total > 0.0 => {
+                let ratio = (out_secs / total).clamp(0.0, 1.0);
+                ((ratio * 100.0).floor() as u32).min(99)
+              }
+              _ => {
+                if last_progress < 95 {
+                  last_progress.saturating_add(1)
+                } else {
+                  last_progress
+                }
+              }
+            };
+
+            if progress > last_progress {
+              last_progress = progress;
+              let _ = app_for_progress.emit(
+                "compress-progress",
+                CompressProgressPayload {
+                  id: id_for_progress.clone(),
+                  progress,
+                },
+              );
+            }
+          }
+        }
+
+        let status = child
+          .wait()
+          .map_err(|e| format!("等待 FFmpeg 结束失败：{e}"))?;
+        let _ = stderr_worker.join();
+
+        if cancel.is_cancelled(&cancel_key) {
+          let _ = fs::remove_file(&encode_path_clone);
+          return Err("已取消压缩".into());
+        }
+
+        if !(status.success() && encode_path_clone.is_file()) {
+          return Err("重排 moov 失败".into());
+        }
+
+        assert_resolution(&ffprobe_for_check, &encode_path_clone, target_wh)?;
+
+        if inplace {
+          replace_file_force(&encode_path_clone, &final_path_clone)?;
+        }
+
+        let output_size = fs::metadata(&final_path_clone)
+          .map(|m| m.len())
+          .unwrap_or(0);
+
+        let _ = app_for_progress.emit(
+          "compress-progress",
+          CompressProgressPayload {
+            id: id_for_progress.clone(),
+            progress: 100,
+          },
+        );
+
+        Ok(CompressResult {
+          output_path: final_path_clone.to_string_lossy().to_string(),
+          output_size,
+          encoder: "copy".into(),
+        })
+      })();
+
+      match remux_outcome {
+        Ok(result) => return Ok(result),
+        Err(e) if e == "已取消压缩" => return Err(e),
+        Err(_) => {
+          let _ = fs::remove_file(&encode_path_clone);
+        }
+      }
+    }
+
     let encoders = encoder_fallback_chain(&ffmpeg);
     let mut last_err = String::from("压缩失败");
+    let vf = letterbox_vf(target_wh.0, target_wh.1);
 
     for (attempt, encoder) in encoders.into_iter().enumerate() {
       if cancel.is_cancelled(&cancel_key) {
@@ -444,9 +662,13 @@ pub async fn compress_video(
         "error",
         "-i",
         input.to_string_lossy().as_ref(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
       ]);
-      // 不传 -s / -vf scale：分辨率与源一致
-      append_video_encode_args(&mut cmd, encoder, &preset, input_wh.0, input_wh.1);
+      cmd.args(["-vf", &vf]);
+      append_video_encode_args(&mut cmd, encoder, &preset, target_wh.0, target_wh.1);
       append_audio_aac_args(&mut cmd, &preset);
       cmd.args([
         "-movflags",
@@ -523,7 +745,7 @@ pub async fn compress_video(
       }
 
       if status.success() && encode_path_clone.is_file() {
-        if let Err(e) = assert_resolution(&ffprobe_for_check, &encode_path_clone, input_wh) {
+        if let Err(e) = assert_resolution(&ffprobe_for_check, &encode_path_clone, target_wh) {
           last_err = e;
           let _ = fs::remove_file(&encode_path_clone);
           // 硬编分辨率异常时继续回退；软编失败则直接返回
@@ -667,6 +889,16 @@ mod tests {
 
     assert!(!is_compressed_output_valid_with_probe(&ffprobe, &output));
 
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn probe_video_codec_reads_h264_name() {
+    let (dir, ffprobe) = fake_ffprobe("h264", true);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
+    assert_eq!(probe_video_codec(&ffprobe, &input).unwrap(), "h264");
     fs::remove_dir_all(dir).unwrap();
   }
 
