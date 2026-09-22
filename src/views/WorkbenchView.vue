@@ -20,7 +20,13 @@ import { showConfirm, showDialog } from '../dialog'
 import { runManualBatchJob } from '../manualBatch'
 import { goToPage } from '../navigation'
 import { showToast } from '../toast'
-import { qualityPresetLabel, settings } from '../settings'
+import {
+  getCompressResolution,
+  getMergeResolution,
+  qualityPresetLabel,
+  resolutionPresetLabel,
+  settings,
+} from '../settings'
 import {
   activeBatchTaskId,
   activeMergeTaskId,
@@ -84,9 +90,19 @@ const resolutionMismatch = computed(() => {
 })
 
 const targetResolutionLabel = computed(() => {
-  const first = items.value.find((i) => i.width && i.height)
-  if (!first?.width || !first.height) return ''
-  return `${first.width}×${first.height}`
+  const sized = items.value.filter((i) => i.width && i.height)
+  if (!sized.length) return ''
+  const portraitCount = sized.filter((i) => i.height! > i.width!).length
+  const landscapeCount = sized.length - portraitCount
+  const portrait =
+    portraitCount > landscapeCount
+      ? true
+      : landscapeCount > portraitCount
+        ? false
+        : sized[0].height! > sized[0].width!
+  const preset = getMergeResolution()
+  if (preset === '720') return portrait ? '720×1280' : '1280×720'
+  return portrait ? '1080×1920' : '1920×1080'
 })
 
 const canSubmit = computed(() => {
@@ -103,7 +119,7 @@ const primaryLabel = computed(() => {
 
 const dropHint = computed(() =>
   mode.value === 'batch'
-    ? '每个文件单独压制，分辨率不变'
+    ? `每个文件单独压制到设置里的压制默认分辨率（${resolutionPresetLabel(getCompressResolution())}，不足则放大，比例不对补黑边）`
     : '按列表顺序合成一个文件 · 至少 2 个',
 )
 
@@ -355,7 +371,7 @@ async function startMerge(normalizeResolution: boolean) {
     const ok = await showConfirm({
       title: '统一分辨率',
       tone: 'warn',
-      message: `所选视频分辨率不同，无法直接合成。\n是否全部统一为第一段的 ${targetResolutionLabel.value} 后合成？`,
+      message: `所选视频分辨率不同，无法直接合成。\n是否全部统一到系统设置的合成默认分辨率（${resolutionPresetLabel(getMergeResolution())} 短边，${targetResolutionLabel.value}，竖屏 720×1280 或 1080×1920，横屏反过来，黑边补满）后合成？`,
       confirmText: '开始合成',
       cancelText: '取消',
     })
@@ -671,7 +687,7 @@ onDeactivated(() => {
         </Transition>
 
         <p v-if="resolutionMismatch" class="summary err mismatch-tip">
-          分辨率不同，无法直接合成。开始后将统一为第一段的 {{ targetResolutionLabel }}。
+          分辨率不同，无法直接合成。开始后将统一到系统设置的合成默认分辨率（{{ resolutionPresetLabel(getMergeResolution()) }} 短边，{{ targetResolutionLabel }}，竖屏 720×1280 或 1080×1920，横屏反过来，黑边补满）。
         </p>
 
         <div class="action-row">
