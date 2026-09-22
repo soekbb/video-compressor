@@ -288,6 +288,48 @@ mod tests {
   }
 
   #[test]
+  fn moov_is_before_mdat_rejects_invalid_atom_sizes() {
+    let dir = std::env::temp_dir().join(format!(
+      "kuaiya-moov-size-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+
+    for (name, too_small_size) in [("size4", 4u32), ("size0", 0u32)] {
+      let path = dir.join(format!("{name}.mp4"));
+      let mut f = fs::File::create(&path).unwrap();
+      f.write_all(&12u32.to_be_bytes()).unwrap();
+      f.write_all(b"ftyp").unwrap();
+      f.write_all(&[0u8; 4]).unwrap();
+      f.write_all(&too_small_size.to_be_bytes()).unwrap();
+      f.write_all(b"free").unwrap();
+      for (kind, payload) in [(b"moov", 16u32), (b"mdat", 32u32)] {
+        let size = 8 + payload;
+        f.write_all(&size.to_be_bytes()).unwrap();
+        f.write_all(kind).unwrap();
+        f.write_all(&vec![0u8; payload as usize]).unwrap();
+      }
+      assert!(!moov_is_before_mdat(&path), "{name}");
+    }
+
+    let truncated_ext = dir.join("truncated_ext.mp4");
+    let mut f = fs::File::create(&truncated_ext).unwrap();
+    f.write_all(&12u32.to_be_bytes()).unwrap();
+    f.write_all(b"ftyp").unwrap();
+    f.write_all(&[0u8; 4]).unwrap();
+    f.write_all(&1u32.to_be_bytes()).unwrap();
+    f.write_all(b"wide").unwrap();
+    f.write_all(&[0u8; 2]).unwrap();
+    assert!(!moov_is_before_mdat(&truncated_ext));
+
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
   fn decide_compress_skip_remux_reencode() {
     assert_eq!(
       decide_compress(true, 720, 1280, 720, 1280, true),
