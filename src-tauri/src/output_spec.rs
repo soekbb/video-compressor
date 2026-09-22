@@ -84,6 +84,7 @@ pub fn moov_is_before_mdat(path: &Path) -> bool {
   };
   let file_len = meta.len();
   let mut off = 0u64;
+  let mut seen_ftyp = false;
   let mut seen_moov: Option<u64> = None;
   let mut seen_mdat: Option<u64> = None;
   let mut hdr = [0u8; 8];
@@ -92,14 +93,17 @@ pub fn moov_is_before_mdat(path: &Path) -> bool {
       break;
     }
     if f.read_exact(&mut hdr).is_err() {
-      break;
+      return false;
     }
     let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
     let kind = &hdr[4..8];
     let box_size = if size == 1 {
+      if off + 16 > file_len {
+        return false;
+      }
       let mut wide = [0u8; 8];
       if f.read_exact(&mut wide).is_err() {
-        break;
+        return false;
       }
       u64::from_be_bytes(wide)
     } else if size == 0 {
@@ -108,21 +112,32 @@ pub fn moov_is_before_mdat(path: &Path) -> bool {
       size
     };
     if box_size < 8 {
-      break;
+      return false;
     }
-    if kind == b"moov" {
-      seen_moov = Some(off);
+    if off.saturating_add(box_size) > file_len {
+      return false;
     }
-    if kind == b"mdat" {
-      seen_mdat = Some(off);
+    if kind == b"ftyp" {
+      seen_ftyp = true;
+    }
+    if seen_ftyp {
+      if kind == b"moov" {
+        seen_moov = Some(off);
+      }
+      if kind == b"mdat" {
+        seen_mdat = Some(off);
+      }
     }
     if seen_moov.is_some() && seen_mdat.is_some() {
       break;
     }
     off = off.saturating_add(box_size);
     if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(off)).is_err() {
-      break;
+      return false;
     }
+  }
+  if !seen_ftyp {
+    return false;
   }
   match (seen_moov, seen_mdat) {
     (Some(moov), Some(mdat)) => moov < mdat,
@@ -237,6 +252,38 @@ mod tests {
     assert!(moov_is_before_mdat(&front));
     assert!(!moov_is_before_mdat(&back));
     assert!(!moov_is_before_mdat(&empty));
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn moov_is_before_mdat_rejects_non_mp4_and_truncated_atoms() {
+    let dir = std::env::temp_dir().join(format!(
+      "kuaiya-moov-fix-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+
+    let no_ftyp = dir.join("no_ftyp.mp4");
+    write_boxes(&no_ftyp, &[(b"moov", 16), (b"mdat", 32)]);
+    assert!(!moov_is_before_mdat(&no_ftyp));
+
+    let truncated = dir.join("truncated.mp4");
+    let mut f = fs::File::create(&truncated).unwrap();
+    f.write_all(&12u32.to_be_bytes()).unwrap();
+    f.write_all(b"ftyp").unwrap();
+    f.write_all(&[0u8; 4]).unwrap();
+    f.write_all(&100u32.to_be_bytes()).unwrap();
+    f.write_all(b"mdat").unwrap();
+    f.write_all(&[0u8; 10]).unwrap();
+    f.write_all(&28u32.to_be_bytes()).unwrap();
+    f.write_all(b"moov").unwrap();
+    f.write_all(&[0u8; 20]).unwrap();
+    assert!(!moov_is_before_mdat(&truncated));
+
     fs::remove_dir_all(dir).unwrap();
   }
 
