@@ -1,3 +1,7 @@
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolutionPreset {
   P720,
@@ -42,6 +46,87 @@ pub fn majority_portrait(sizes: &[(u32, u32)]) -> bool {
     false
   } else {
     sizes[0].1 > sizes[0].0
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressAction {
+  Skip,
+  RemuxFaststart,
+  Reencode,
+}
+
+pub fn decide_compress(
+  h264: bool,
+  src_w: u32,
+  src_h: u32,
+  target_w: u32,
+  target_h: u32,
+  moov_before_mdat: bool,
+) -> CompressAction {
+  if h264 && src_w == target_w && src_h == target_h {
+    if moov_before_mdat {
+      CompressAction::Skip
+    } else {
+      CompressAction::RemuxFaststart
+    }
+  } else {
+    CompressAction::Reencode
+  }
+}
+
+pub fn moov_is_before_mdat(path: &Path) -> bool {
+  let Ok(mut f) = fs::File::open(path) else {
+    return false;
+  };
+  let Ok(meta) = f.metadata() else {
+    return false;
+  };
+  let file_len = meta.len();
+  let mut off = 0u64;
+  let mut seen_moov: Option<u64> = None;
+  let mut seen_mdat: Option<u64> = None;
+  let mut hdr = [0u8; 8];
+  for _ in 0..16 {
+    if off + 8 > file_len {
+      break;
+    }
+    if f.read_exact(&mut hdr).is_err() {
+      break;
+    }
+    let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+    let kind = &hdr[4..8];
+    let box_size = if size == 1 {
+      let mut wide = [0u8; 8];
+      if f.read_exact(&mut wide).is_err() {
+        break;
+      }
+      u64::from_be_bytes(wide)
+    } else if size == 0 {
+      file_len - off
+    } else {
+      size
+    };
+    if box_size < 8 {
+      break;
+    }
+    if kind == b"moov" {
+      seen_moov = Some(off);
+    }
+    if kind == b"mdat" {
+      seen_mdat = Some(off);
+    }
+    if seen_moov.is_some() && seen_mdat.is_some() {
+      break;
+    }
+    off = off.saturating_add(box_size);
+    if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(off)).is_err() {
+      break;
+    }
+  }
+  match (seen_moov, seen_mdat) {
+    (Some(moov), Some(mdat)) => moov < mdat,
+    _ => false,
   }
 }
 
@@ -117,5 +202,61 @@ mod tests {
     assert!(majority_portrait(&[(720, 1280), (1920, 1080)]));
     assert!(!majority_portrait(&[(1920, 1080), (720, 1280)]));
     assert!(majority_portrait(&[]));
+  }
+
+  use std::fs;
+  use std::io::Write;
+
+  fn write_boxes(path: &std::path::Path, boxes: &[(&[u8; 4], u32)]) {
+    let mut f = fs::File::create(path).unwrap();
+    for (kind, payload) in boxes {
+      let size = 8 + payload;
+      f.write_all(&size.to_be_bytes()).unwrap();
+      f.write_all(*kind).unwrap();
+      f.write_all(&vec![0u8; *payload as usize]).unwrap();
+    }
+  }
+
+  #[test]
+  fn moov_is_before_mdat_detects_faststart_and_postponed() {
+    let dir = std::env::temp_dir().join(format!(
+      "kuaiya-moov-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let front = dir.join("front.mp4");
+    write_boxes(&front, &[(b"ftyp", 4), (b"moov", 16), (b"mdat", 32)]);
+    let back = dir.join("back.mp4");
+    write_boxes(&back, &[(b"ftyp", 4), (b"mdat", 32), (b"moov", 16)]);
+    let empty = dir.join("empty.bin");
+    fs::write(&empty, [0u8; 3]).unwrap();
+    assert!(moov_is_before_mdat(&front));
+    assert!(!moov_is_before_mdat(&back));
+    assert!(!moov_is_before_mdat(&empty));
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn decide_compress_skip_remux_reencode() {
+    assert_eq!(
+      decide_compress(true, 720, 1280, 720, 1280, true),
+      CompressAction::Skip
+    );
+    assert_eq!(
+      decide_compress(true, 720, 1280, 720, 1280, false),
+      CompressAction::RemuxFaststart
+    );
+    assert_eq!(
+      decide_compress(false, 720, 1280, 720, 1280, true),
+      CompressAction::Reencode
+    );
+    assert_eq!(
+      decide_compress(true, 1080, 1920, 720, 1280, true),
+      CompressAction::Reencode
+    );
   }
 }
