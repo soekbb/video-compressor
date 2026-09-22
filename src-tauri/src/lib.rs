@@ -1,5 +1,6 @@
 mod compress;
 mod encode;
+mod output_spec;
 mod media;
 mod persist;
 mod replace;
