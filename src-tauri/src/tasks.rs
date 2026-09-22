@@ -1,3 +1,4 @@
+use crate::output_spec::{parse_resolution_preset, ResolutionPreset};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -49,6 +50,8 @@ pub struct AppSettingsRecord {
   pub scan_interval_minutes: u32,
   pub quality_preset: String,
   pub auto_scan_on_launch: bool,
+  pub compress_resolution: String,
+  pub merge_resolution: String,
 }
 
 fn settings_columns(conn: &Connection) -> Result<Vec<String>, String> {
@@ -82,6 +85,24 @@ fn migrate_settings_columns(conn: &Connection) -> Result<(), String> {
       )
       .map_err(|e| format!("升级设置表失败：{e}"))?;
   }
+  let cols = settings_columns(conn)?;
+  if !cols.iter().any(|c| c == "compress_resolution") {
+    conn
+      .execute(
+        "ALTER TABLE settings ADD COLUMN compress_resolution TEXT NOT NULL DEFAULT '720'",
+        [],
+      )
+      .map_err(|e| format!("升级设置表失败：{e}"))?;
+  }
+  let cols = settings_columns(conn)?;
+  if !cols.iter().any(|c| c == "merge_resolution") {
+    conn
+      .execute(
+        "ALTER TABLE settings ADD COLUMN merge_resolution TEXT NOT NULL DEFAULT '1080'",
+        [],
+      )
+      .map_err(|e| format!("升级设置表失败：{e}"))?;
+  }
   Ok(())
 }
 
@@ -108,7 +129,9 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         concurrency INTEGER NOT NULL,
         scan_interval_minutes INTEGER NOT NULL,
         quality_preset TEXT NOT NULL DEFAULT 'size',
-        auto_scan_on_launch INTEGER NOT NULL DEFAULT 0
+        auto_scan_on_launch INTEGER NOT NULL DEFAULT 0,
+        compress_resolution TEXT NOT NULL DEFAULT '720',
+        merge_resolution TEXT NOT NULL DEFAULT '1080'
       );
       "#,
     )
@@ -256,6 +279,20 @@ fn normalize_quality_preset(v: &str) -> String {
   }
 }
 
+fn normalize_compress_resolution(v: &str) -> String {
+  match parse_resolution_preset(v, ResolutionPreset::P720) {
+    ResolutionPreset::P720 => "720".into(),
+    ResolutionPreset::P1080 => "1080".into(),
+  }
+}
+
+fn normalize_merge_resolution(v: &str) -> String {
+  match parse_resolution_preset(v, ResolutionPreset::P1080) {
+    ResolutionPreset::P720 => "720".into(),
+    ResolutionPreset::P1080 => "1080".into(),
+  }
+}
+
 #[tauri::command]
 pub fn load_settings(db: State<'_, TaskDb>) -> Result<AppSettingsRecord, String> {
   let conn = db.conn.lock().map_err(|_| "任务数据库忙碌".to_string())?;
@@ -263,7 +300,8 @@ pub fn load_settings(db: State<'_, TaskDb>) -> Result<AppSettingsRecord, String>
   init_schema(&conn)?;
   let row = conn
     .query_row(
-      "SELECT concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch
+      "SELECT concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch,
+              compress_resolution, merge_resolution
        FROM settings WHERE id = 1",
       [],
       |r| {
@@ -272,6 +310,8 @@ pub fn load_settings(db: State<'_, TaskDb>) -> Result<AppSettingsRecord, String>
           scan_interval_minutes: clamp_interval(r.get::<_, i64>(1)? as u32),
           quality_preset: normalize_quality_preset(&r.get::<_, String>(2)?),
           auto_scan_on_launch: r.get::<_, i64>(3)? != 0,
+          compress_resolution: normalize_compress_resolution(&r.get::<_, String>(4)?),
+          merge_resolution: normalize_merge_resolution(&r.get::<_, String>(5)?),
         })
       },
     )
@@ -284,23 +324,69 @@ pub fn save_settings(db: State<'_, TaskDb>, settings: AppSettingsRecord) -> Resu
   let conn = db.conn.lock().map_err(|_| "任务数据库忙碌".to_string())?;
   init_schema(&conn)?;
   let preset = normalize_quality_preset(&settings.quality_preset);
+  let compress_resolution = normalize_compress_resolution(&settings.compress_resolution);
+  let merge_resolution = normalize_merge_resolution(&settings.merge_resolution);
   conn
     .execute(
       "INSERT INTO settings
-         (id, concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch)
-       VALUES (1, ?1, ?2, ?3, ?4)
+         (id, concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch,
+          compress_resolution, merge_resolution)
+       VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
        ON CONFLICT(id) DO UPDATE SET
          concurrency = excluded.concurrency,
          scan_interval_minutes = excluded.scan_interval_minutes,
          quality_preset = excluded.quality_preset,
-         auto_scan_on_launch = excluded.auto_scan_on_launch",
+         auto_scan_on_launch = excluded.auto_scan_on_launch,
+         compress_resolution = excluded.compress_resolution,
+         merge_resolution = excluded.merge_resolution",
       params![
         clamp_concurrency(settings.concurrency) as i64,
         clamp_interval(settings.scan_interval_minutes) as i64,
         preset,
         if settings.auto_scan_on_launch { 1_i64 } else { 0_i64 },
+        compress_resolution,
+        merge_resolution,
       ],
     )
     .map_err(|e| format!("保存设置失败：{e}"))?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rusqlite::Connection;
+
+  #[test]
+  fn migrate_adds_resolution_columns_with_defaults() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn
+      .execute_batch(
+        r#"
+        CREATE TABLE settings (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          concurrency INTEGER NOT NULL,
+          scan_interval_minutes INTEGER NOT NULL,
+          quality_preset TEXT NOT NULL DEFAULT 'size',
+          auto_scan_on_launch INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO settings (id, concurrency, scan_interval_minutes, quality_preset, auto_scan_on_launch)
+        VALUES (1, 2, 3, 'size', 0);
+        "#,
+      )
+      .unwrap();
+    migrate_settings_columns(&conn).unwrap();
+    let cols = settings_columns(&conn).unwrap();
+    assert!(cols.iter().any(|c| c == "compress_resolution"));
+    assert!(cols.iter().any(|c| c == "merge_resolution"));
+    let (c, m): (String, String) = conn
+      .query_row(
+        "SELECT compress_resolution, merge_resolution FROM settings WHERE id = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+      )
+      .unwrap();
+    assert_eq!(c, "720");
+    assert_eq!(m, "1080");
+  }
 }
