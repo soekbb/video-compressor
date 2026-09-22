@@ -8,13 +8,15 @@ import {
   recommendConcurrency,
 } from '../systemInfo'
 import { showToast } from '../toast'
-import type { QualityPreset, SystemInfo } from '../types'
+import type { QualityPreset, ResolutionPreset, SystemInfo } from '../types'
 
 const savedTip = ref(false)
 const saving = ref(false)
 const concurrencyInput = ref(String(settings.value.concurrency))
 const intervalInput = ref(String(settings.value.scanIntervalMinutes))
 const qualityPreset = ref<QualityPreset>(settings.value.qualityPreset)
+const compressResolution = ref<ResolutionPreset>(settings.value.compressResolution)
+const mergeResolution = ref<ResolutionPreset>(settings.value.mergeResolution)
 const autoScanOnLaunch = ref(settings.value.autoScanOnLaunch)
 const systemInfo = ref<SystemInfo | null>(null)
 const encoderStatus = ref<EncoderStatus | null>(null)
@@ -42,6 +44,8 @@ const isDirty = computed(() => {
     concurrency !== settings.value.concurrency ||
     interval !== settings.value.scanIntervalMinutes ||
     qualityPreset.value !== settings.value.qualityPreset ||
+    compressResolution.value !== settings.value.compressResolution ||
+    mergeResolution.value !== settings.value.mergeResolution ||
     autoScanOnLaunch.value !== settings.value.autoScanOnLaunch
   )
 })
@@ -50,6 +54,8 @@ function syncFromSaved() {
   concurrencyInput.value = String(settings.value.concurrency)
   intervalInput.value = String(settings.value.scanIntervalMinutes)
   qualityPreset.value = settings.value.qualityPreset
+  compressResolution.value = settings.value.compressResolution
+  mergeResolution.value = settings.value.mergeResolution
   autoScanOnLaunch.value = settings.value.autoScanOnLaunch
 }
 
@@ -115,6 +121,8 @@ async function saveSettings() {
       concurrency,
       scanIntervalMinutes: interval,
       qualityPreset: qualityPreset.value,
+      compressResolution: compressResolution.value,
+      mergeResolution: mergeResolution.value,
       autoScanOnLaunch: autoScanOnLaunch.value,
     })
     syncFromSaved()
@@ -134,6 +142,16 @@ function setQuality(preset: QualityPreset) {
 function setAutoScan(enabled: boolean) {
   if (autoScanOnLaunch.value === enabled) return
   autoScanOnLaunch.value = enabled
+}
+
+function setCompressResolution(preset: ResolutionPreset) {
+  if (compressResolution.value === preset) return
+  compressResolution.value = preset
+}
+
+function setMergeResolution(preset: ResolutionPreset) {
+  if (mergeResolution.value === preset) return
+  mergeResolution.value = preset
 }
 </script>
 
@@ -260,7 +278,7 @@ function setAutoScan(enabled: boolean) {
         <div class="setting-meta">
           <h3>画质档位</h3>
           <p>
-            体积优先：x264 CRF 23 + faster，体积适中、速度更快；画质优先：CRF 18，更清晰。分辨率均不变
+            体积优先：x264 CRF 23 + faster，体积适中、速度更快；画质优先：CRF 18，更清晰。画面缩放到下面的默认分辨率（不足则放大，比例不对补黑边）
           </p>
         </div>
         <div class="setting-control setting-control-wide">
@@ -285,7 +303,7 @@ function setAutoScan(enabled: boolean) {
         </div>
       </div>
 
-      <div class="setting-row setting-row-wide last">
+      <div class="setting-row setting-row-wide">
         <div class="setting-meta">
           <h3>启动时自动扫描</h3>
           <p>
@@ -309,6 +327,60 @@ function setAutoScan(enabled: boolean) {
               @click="setAutoScan(true)"
             >
               开启
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-row setting-row-wide">
+        <div class="setting-meta">
+          <h3>压制默认分辨率</h3>
+          <p>手动与自动压制输出对齐到此画幅；小于目标则放大，比例不对补黑边</p>
+        </div>
+        <div class="setting-control setting-control-wide">
+          <div class="preset-switch" role="group" aria-label="压制默认分辨率">
+            <button
+              type="button"
+              class="preset-option"
+              :class="{ active: compressResolution === '720' }"
+              @click="setCompressResolution('720')"
+            >
+              720p
+            </button>
+            <button
+              type="button"
+              class="preset-option"
+              :class="{ active: compressResolution === '1080' }"
+              @click="setCompressResolution('1080')"
+            >
+              1080p
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting-row setting-row-wide last">
+        <div class="setting-meta">
+          <h3>合成默认分辨率</h3>
+          <p>仅在分集分辨率不一致时对齐到此画幅；已一致则不改</p>
+        </div>
+        <div class="setting-control setting-control-wide">
+          <div class="preset-switch" role="group" aria-label="合成默认分辨率">
+            <button
+              type="button"
+              class="preset-option"
+              :class="{ active: mergeResolution === '720' }"
+              @click="setMergeResolution('720')"
+            >
+              720p
+            </button>
+            <button
+              type="button"
+              class="preset-option"
+              :class="{ active: mergeResolution === '1080' }"
+              @click="setMergeResolution('1080')"
+            >
+              1080p
             </button>
           </div>
         </div>

@@ -2,7 +2,7 @@
 import { computed, onMounted, watch } from 'vue'
 import { initAutoStore } from './autoStore'
 import { currentPage, goToPage } from './navigation'
-import { initSettings, qualityPresetLabel, settings } from './settings'
+import { initSettings, qualityPresetLabel, resolutionPresetLabel, settings } from './settings'
 import { initNotifications, notifyDesktop } from './notify'
 import {
   initTaskStore,
@@ -198,7 +198,7 @@ const nav: { id: AppPage; label: string }[] = [
         </button>
       </nav>
 
-      <p class="sidebar-foot">分辨率不变 · {{ qualityPresetLabel(settings.qualityPreset) }}</p>
+      <p class="sidebar-foot">{{ resolutionPresetLabel(settings.compressResolution) }} · {{ qualityPresetLabel(settings.qualityPreset) }}</p>
     </aside>
 
     <main class="main">

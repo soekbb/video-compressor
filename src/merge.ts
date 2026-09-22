@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { isTauri } from './desktop'
-import { getQualityPreset } from './settings'
+import { getMergeResolution, getQualityPreset } from './settings'
 
 export type MergeResult = {
   outputPath: string
@@ -50,6 +50,7 @@ export async function mergeVideos(params: {
       outputDir: params.outputDir,
       outputName: params.outputName,
       qualityPreset: getQualityPreset(),
+      mergeResolution: getMergeResolution(),
       normalizeResolution: params.normalizeResolution ?? false,
       cancelKey: params.cancelKey,
     })

@@ -18,12 +18,16 @@ export type AppPage = 'workbench' | 'auto' | 'tasks' | 'settings'
 /** size=体积优先，quality=画质优先 */
 export type QualityPreset = 'size' | 'quality'
 
+export type ResolutionPreset = '720' | '1080'
+
 export type AppSettings = {
   concurrency: number
   scanIntervalMinutes: number
   qualityPreset: QualityPreset
   /** 打开软件时是否自动开启自动压制扫描 */
   autoScanOnLaunch: boolean
+  compressResolution: ResolutionPreset
+  mergeResolution: ResolutionPreset
 }
 
 export type SystemInfo = {

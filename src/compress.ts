@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { isTauri } from './desktop'
-import { getConcurrency, getQualityPreset } from './settings'
+import { getCompressResolution, getConcurrency, getQualityPreset } from './settings'
 
 export type CompressResult = {
   outputPath: string
@@ -77,6 +77,7 @@ export async function compressVideo(params: {
       outputDir: params.outputDir,
       outputName: params.outputName,
       qualityPreset: getQualityPreset(),
+      targetResolution: getCompressResolution(),
       cancelKey: params.cancelKey,
     })
   } finally {

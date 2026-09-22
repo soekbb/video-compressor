@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { ref } from 'vue'
-import { isTauri } from './desktop'
-import type { AppSettings, QualityPreset } from './types'
+import { isTauri } from './desktop.ts'
+import type { AppSettings, QualityPreset, ResolutionPreset } from './types'
 
 const STORAGE_KEY = 'kuaiya-settings'
 
@@ -10,6 +10,8 @@ const defaults: AppSettings = {
   scanIntervalMinutes: 3,
   qualityPreset: 'size',
   autoScanOnLaunch: false,
+  compressResolution: '720',
+  mergeResolution: '1080',
 }
 
 function clampConcurrency(n: number) {
@@ -24,6 +26,13 @@ function normalizePreset(v: unknown): QualityPreset {
   return v === 'quality' ? 'quality' : 'size'
 }
 
+export function normalizeResolutionPreset(
+  value: unknown,
+  fallback: ResolutionPreset,
+): ResolutionPreset {
+  return value === '720' || value === '1080' ? value : fallback
+}
+
 function normalize(partial: Partial<AppSettings>): AppSettings {
   return {
     concurrency: clampConcurrency(partial.concurrency ?? defaults.concurrency),
@@ -32,6 +41,14 @@ function normalize(partial: Partial<AppSettings>): AppSettings {
     ),
     qualityPreset: normalizePreset(partial.qualityPreset ?? defaults.qualityPreset),
     autoScanOnLaunch: Boolean(partial.autoScanOnLaunch ?? defaults.autoScanOnLaunch),
+    compressResolution: normalizeResolutionPreset(
+      partial.compressResolution ?? defaults.compressResolution,
+      '720',
+    ),
+    mergeResolution: normalizeResolutionPreset(
+      partial.mergeResolution ?? defaults.mergeResolution,
+      '1080',
+    ),
   }
 }
 
@@ -59,6 +76,8 @@ async function persist(value: AppSettings) {
       scanIntervalMinutes: value.scanIntervalMinutes,
       qualityPreset: value.qualityPreset,
       autoScanOnLaunch: value.autoScanOnLaunch,
+      compressResolution: value.compressResolution,
+      mergeResolution: value.mergeResolution,
     },
   })
 }
@@ -87,6 +106,8 @@ export async function updateSettings(patch: Partial<AppSettings>) {
     scanIntervalMinutes: patch.scanIntervalMinutes ?? settings.value.scanIntervalMinutes,
     qualityPreset: patch.qualityPreset ?? settings.value.qualityPreset,
     autoScanOnLaunch: patch.autoScanOnLaunch ?? settings.value.autoScanOnLaunch,
+    compressResolution: patch.compressResolution ?? settings.value.compressResolution,
+    mergeResolution: patch.mergeResolution ?? settings.value.mergeResolution,
   })
   settings.value = next
   try {
@@ -107,4 +128,16 @@ export function getQualityPreset(): QualityPreset {
 
 export function qualityPresetLabel(preset: QualityPreset = settings.value.qualityPreset) {
   return preset === 'quality' ? '画质优先' : '体积优先'
+}
+
+export function getCompressResolution(): ResolutionPreset {
+  return settings.value.compressResolution
+}
+
+export function getMergeResolution(): ResolutionPreset {
+  return settings.value.mergeResolution
+}
+
+export function resolutionPresetLabel(preset: ResolutionPreset): string {
+  return preset === '720' ? '720p' : '1080p'
 }
