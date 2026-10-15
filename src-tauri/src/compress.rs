@@ -98,6 +98,14 @@ impl CompressState {
   }
 }
 
+/// ffprobe 打不开画面时的用户可见原因。缺少 moov 的文件无法补救。
+fn video_size_probe_error(stderr: &str) -> String {
+  if let Some(reason) = crate::ffmpeg_error::classify(stderr) {
+    return reason.into();
+  }
+  "无法读取视频分辨率".into()
+}
+
 /// 读取视频流宽高（coded width/height）。
 pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), String> {
   let mut command = Command::new(ffprobe);
@@ -115,12 +123,13 @@ pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), Stri
       input.to_string_lossy().as_ref(),
     ])
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped())
     .output()
     .map_err(|e| format!("探测分辨率失败：{e}"))?;
 
   if !output.status.success() {
-    return Err("无法读取视频分辨率".into());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    return Err(video_size_probe_error(&stderr));
   }
 
   let text = String::from_utf8_lossy(&output.stdout);
@@ -145,6 +154,58 @@ pub fn probe_video_size(ffprobe: &Path, input: &Path) -> Result<(u32, u32), Stri
     return Err("视频分辨率为 0".into());
   }
   Ok((width, height))
+}
+
+/// 读取视频流里可读到的 packet 数。0 表示文件里没有任何可解码的画面数据。
+pub fn probe_video_packet_count(ffprobe: &Path, input: &Path) -> Result<u64, String> {
+  let mut command = Command::new(ffprobe);
+  configure_subprocess(&mut command);
+  let output = command
+    .args([
+      "-v",
+      "error",
+      "-count_packets",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=nb_read_packets",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      input.to_string_lossy().as_ref(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .map_err(|e| format!("探测视频包数失败：{e}"))?;
+
+  if !output.status.success() {
+    return Err(video_size_probe_error(&String::from_utf8_lossy(&output.stderr)));
+  }
+
+  let text = String::from_utf8_lossy(&output.stdout);
+  let value = text
+    .lines()
+    .map(str::trim)
+    .find(|line| !line.is_empty())
+    .ok_or_else(|| "无法读取视频包数".to_string())?;
+
+  // 没有视频流时 ffprobe 输出 N/A
+  if value.eq_ignore_ascii_case("n/a") {
+    return Ok(0);
+  }
+  value
+    .parse::<u64>()
+    .map_err(|_| format!("视频包数格式无效：{value}"))
+}
+
+/// 压制前预检：源文件里一个视频包都没有时直接给出可读原因，不再白跑一整轮重编码。
+///
+/// 探测本身失败时不拦截（可能是 ffprobe 的偶发问题），交给真正的压制流程报错。
+fn ensure_source_has_video_packets(ffprobe: &Path, input: &Path) -> Result<(), String> {
+  match probe_video_packet_count(ffprobe, input) {
+    Ok(0) => Err(crate::ffmpeg_error::NO_VIDEO_PACKETS.into()),
+    _ => Ok(()),
+  }
 }
 
 /// 读取视频流编码器名称（如 h264）。
@@ -443,6 +504,15 @@ pub async fn compress_video(
   );
   let target_wh = target_canvas(preset_res, input_wh.0, input_wh.1);
   let codec = probe_video_codec(&ffprobe, &input)?;
+  let av1_decoder = if codec.eq_ignore_ascii_case("av1") {
+    Some(
+      crate::encode::preferred_av1_decoder(&ffmpeg).ok_or_else(|| {
+        "这份 FFmpeg 解不了 AV1（需要 libdav1d 或 libaom-av1）".to_string()
+      })?,
+    )
+  } else {
+    None
+  };
   let h264 = codec.eq_ignore_ascii_case("h264");
   let moov_front = moov_is_before_mdat(&input);
   let action = decide_compress(h264, input_wh.0, input_wh.1, target_wh.0, target_wh.1, moov_front);
@@ -633,6 +703,9 @@ pub async fn compress_video(
       }
     }
 
+    // 走到这里一定要重编码：先确认源文件真的有可解码的画面数据，避免白跑一整轮。
+    ensure_source_has_video_packets(&ffprobe_for_check, &input)?;
+
     let encoders = encoder_fallback_chain(&ffmpeg);
     let mut last_err = String::from("压缩失败");
     let vf = letterbox_vf(target_wh.0, target_wh.1);
@@ -655,11 +728,11 @@ pub async fn compress_video(
 
       let mut cmd = Command::new(&ffmpeg);
       configure_subprocess(&mut cmd);
+      cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+      if let Some(decoder) = av1_decoder {
+        cmd.args(["-c:v", decoder]);
+      }
       cmd.args([
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
         "-i",
         input.to_string_lossy().as_ref(),
         "-map",
@@ -783,11 +856,7 @@ pub async fn compress_video(
         });
       }
 
-      let detail = err_buf
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("FFmpeg 压缩失败");
+      let detail = crate::ffmpeg_error::ffmpeg_failure_detail(&err_buf, "FFmpeg 未输出错误信息");
       last_err = format!("压缩失败（{}）：{detail}", encoder.ffmpeg_name());
       let _ = fs::remove_file(&encode_path_clone);
 
@@ -835,6 +904,15 @@ mod tests {
 
   const MINIMAL_Y4M_VIDEO: &[u8] =
     b"YUV4MPEG2 W2 H2 F1:1 Ip A1:1 C420jpeg\nFRAME\n\x10\x10\x10\x10\x80\x80";
+
+  #[test]
+  fn missing_moov_probe_explains_incomplete_file() {
+    let err = video_size_probe_error(
+      "[mov,mp4,m4a,3gp,3g2,mj2] moov atom not found\nInvalid data found when processing input\n",
+    );
+    assert!(err.contains("缺少 moov"));
+    assert_eq!(video_size_probe_error("nothing useful"), "无法读取视频分辨率");
+  }
 
   #[cfg(unix)]
   fn fake_ffprobe(stdout: &str, succeeds: bool) -> (PathBuf, PathBuf) {
@@ -899,6 +977,44 @@ mod tests {
     let input = dir.join("clip.mp4");
     fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
     assert_eq!(probe_video_codec(&ffprobe, &input).unwrap(), "h264");
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn packet_preflight_reads_counts_and_flags_empty_sources() {
+    let (dir, ffprobe) = fake_ffprobe("3540", true);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
+    assert_eq!(probe_video_packet_count(&ffprobe, &input).unwrap(), 3540);
+    assert!(ensure_source_has_video_packets(&ffprobe, &input).is_ok());
+    fs::remove_dir_all(dir).unwrap();
+
+    // ffprobe 对没有视频流的文件输出 N/A → 直接判定源文件无效
+    let (dir, ffprobe) = fake_ffprobe("N/A", true);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
+    assert_eq!(probe_video_packet_count(&ffprobe, &input).unwrap(), 0);
+    let err = ensure_source_has_video_packets(&ffprobe, &input).unwrap_err();
+    assert!(err.contains("没有可解码的画面数据"), "{err}");
+    fs::remove_dir_all(dir).unwrap();
+
+    let (dir, ffprobe) = fake_ffprobe("0", true);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
+    assert!(ensure_source_has_video_packets(&ffprobe, &input).is_err());
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn packet_preflight_does_not_block_when_probe_itself_fails() {
+    let (dir, ffprobe) = fake_ffprobe("", false);
+    let input = dir.join("clip.mp4");
+    fs::write(&input, MINIMAL_Y4M_VIDEO).unwrap();
+    assert!(probe_video_packet_count(&ffprobe, &input).is_err());
+    // 探测失败不拦截，交给真正的压制流程报错
+    assert!(ensure_source_has_video_packets(&ffprobe, &input).is_ok());
     fs::remove_dir_all(dir).unwrap();
   }
 

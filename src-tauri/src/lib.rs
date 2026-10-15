@@ -1,5 +1,6 @@
 mod compress;
 mod encode;
+mod ffmpeg_error;
 mod output_spec;
 mod media;
 mod persist;

@@ -338,7 +338,7 @@ async function onReveal(task: AppTask) {
               :id="`task-failures-${task.id}`"
               class="failure-details"
             >
-              <p class="failure-details-title">失败文件与最终 FFmpeg 错误</p>
+              <p class="failure-details-title">失败文件与错误详情</p>
               <ul class="failure-list">
                 <li
                   v-for="(failure, index) in taskFailures(task)"

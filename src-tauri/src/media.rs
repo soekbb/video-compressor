@@ -13,6 +13,7 @@ use crate::encode::{
   append_audio_aac_args, append_audio_aac_unified_args, append_video_encode_args,
   encoder_fallback_chain, mark_hw_encoder_failed, VideoEncoderKind,
 };
+use crate::ffmpeg_error::ffmpeg_failure_detail;
 use crate::output_spec::{
   letterbox_vf, majority_portrait, parse_resolution_preset, target_canvas, ResolutionPreset,
 };
@@ -1055,11 +1056,7 @@ pub async fn merge_videos(
                 .map_err(|e| format!("等待规范化结束失败：{e}"))?;
               let err_buf = stderr_worker.join().unwrap_or_default();
               if !status.success() {
-                let detail = err_buf
-                  .lines()
-                  .rev()
-                  .find(|l| !l.trim().is_empty())
-                  .unwrap_or("规范化失败");
+                let detail = ffmpeg_failure_detail(&err_buf, "FFmpeg 未输出错误信息");
                 return Err(format!("规范化失败：{detail}"));
               }
               let probed = probe_stream_fingerprint(&ffprobe_for_check, &temp)?;
@@ -1167,11 +1164,7 @@ pub async fn merge_videos(
 
       if !status.success() {
         let _ = fs::remove_file(&output_path_clone);
-        let detail = err_buf
-          .lines()
-          .rev()
-          .find(|l| !l.trim().is_empty())
-          .unwrap_or("合成失败");
+        let detail = ffmpeg_failure_detail(&err_buf, "FFmpeg 未输出错误信息");
         return Err(format!("合成失败：{detail}"));
       }
       Ok(())

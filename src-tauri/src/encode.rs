@@ -206,6 +206,54 @@ fn platform_hw_candidates() -> &'static [VideoEncoderKind] {
   }
 }
 
+/// NVIDIA/达芬奇的 AV1 序列头在 av1C 里。自带 `av1` 解码器会报 Missing Sequence Header，一帧都不出。
+/// `libdav1d` 更快；没有时用 `libaom-av1`。都没有则不要回退到自带解码器。
+pub fn select_av1_decoder<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+  let mut has_aom = false;
+  for name in names {
+    if name == "libdav1d" {
+      return Some("libdav1d");
+    }
+    if name == "libaom-av1" {
+      has_aom = true;
+    }
+  }
+  if has_aom {
+    Some("libaom-av1")
+  } else {
+    None
+  }
+}
+
+fn decoder_names(ffmpeg: &Path) -> Vec<String> {
+  let mut command = Command::new(ffmpeg);
+  configure_subprocess(&mut command);
+  let output = command
+    .args(["-hide_banner", "-decoders"])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output();
+  let Ok(out) = output else {
+    return Vec::new();
+  };
+  if !out.status.success() {
+    return Vec::new();
+  }
+  String::from_utf8_lossy(&out.stdout)
+    .lines()
+    .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
+    .collect()
+}
+
+/// 当前 FFmpeg 能用来解 AV1 的解码器。进程内缓存一次。
+pub fn preferred_av1_decoder(ffmpeg: &Path) -> Option<&'static str> {
+  static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
+  *CACHED.get_or_init(|| {
+    let names = decoder_names(ffmpeg);
+    select_av1_decoder(names.iter().map(String::as_str))
+  })
+}
+
 fn ffmpeg_lists_encoder(ffmpeg: &Path, name: &str) -> bool {
   let mut command = Command::new(ffmpeg);
   configure_subprocess(&mut command);
@@ -408,6 +456,16 @@ mod tests {
     if let Ok(mut g) = hw_gate().lock() {
       *g = HwRuntimeGate::default();
     }
+  }
+
+  #[test]
+  fn select_av1_decoder_prefers_dav1d_then_aom() {
+    assert_eq!(
+      select_av1_decoder(["av1", "libaom-av1", "libdav1d"]),
+      Some("libdav1d")
+    );
+    assert_eq!(select_av1_decoder(["av1", "libaom-av1"]), Some("libaom-av1"));
+    assert_eq!(select_av1_decoder(["av1"]), None);
   }
 
   #[test]
