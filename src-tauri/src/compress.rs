@@ -499,8 +499,8 @@ pub async fn compress_video(
   };
 
   let preset_res = parse_resolution_preset(
-    target_resolution.as_deref().unwrap_or("720"),
-    ResolutionPreset::P720,
+    target_resolution.as_deref().unwrap_or("1080"),
+    ResolutionPreset::P1080,
   );
   let target_wh = target_canvas(preset_res, input_wh.0, input_wh.1);
   let codec = probe_video_codec(&ffprobe, &input)?;

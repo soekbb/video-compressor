@@ -89,7 +89,7 @@ fn migrate_settings_columns(conn: &Connection) -> Result<(), String> {
   if !cols.iter().any(|c| c == "compress_resolution") {
     conn
       .execute(
-        "ALTER TABLE settings ADD COLUMN compress_resolution TEXT NOT NULL DEFAULT '720'",
+        "ALTER TABLE settings ADD COLUMN compress_resolution TEXT NOT NULL DEFAULT '1080'",
         [],
       )
       .map_err(|e| format!("升级设置表失败：{e}"))?;
@@ -130,7 +130,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         scan_interval_minutes INTEGER NOT NULL,
         quality_preset TEXT NOT NULL DEFAULT 'size',
         auto_scan_on_launch INTEGER NOT NULL DEFAULT 0,
-        compress_resolution TEXT NOT NULL DEFAULT '720',
+        compress_resolution TEXT NOT NULL DEFAULT '1080',
         merge_resolution TEXT NOT NULL DEFAULT '1080'
       );
       "#,
@@ -280,7 +280,7 @@ fn normalize_quality_preset(v: &str) -> String {
 }
 
 fn normalize_compress_resolution(v: &str) -> String {
-  match parse_resolution_preset(v, ResolutionPreset::P720) {
+  match parse_resolution_preset(v, ResolutionPreset::P1080) {
     ResolutionPreset::P720 => "720".into(),
     ResolutionPreset::P1080 => "1080".into(),
   }
@@ -386,7 +386,7 @@ mod tests {
         |r| Ok((r.get(0)?, r.get(1)?)),
       )
       .unwrap();
-    assert_eq!(c, "720");
+    assert_eq!(c, "1080");
     assert_eq!(m, "1080");
   }
 }

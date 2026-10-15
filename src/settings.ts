@@ -10,7 +10,7 @@ const defaults: AppSettings = {
   scanIntervalMinutes: 3,
   qualityPreset: 'size',
   autoScanOnLaunch: false,
-  compressResolution: '720',
+  compressResolution: '1080',
   mergeResolution: '1080',
 }
 
@@ -43,7 +43,7 @@ function normalize(partial: Partial<AppSettings>): AppSettings {
     autoScanOnLaunch: Boolean(partial.autoScanOnLaunch ?? defaults.autoScanOnLaunch),
     compressResolution: normalizeResolutionPreset(
       partial.compressResolution ?? defaults.compressResolution,
-      '720',
+      '1080',
     ),
     mergeResolution: normalizeResolutionPreset(
       partial.mergeResolution ?? defaults.mergeResolution,
