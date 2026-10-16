@@ -33,6 +33,8 @@ const currentView = computed(() =>
     : viewMap[currentPage.value as Exclude<AppPage, 'auto'>],
 )
 
+const appVersion = __APP_VERSION__
+
 const activeTaskCount = computed(
   () => tasks.value.filter((t) => t.status === 'running' || t.status === 'pending').length,
 )
@@ -198,7 +200,10 @@ const nav: { id: AppPage; label: string }[] = [
         </button>
       </nav>
 
-      <p class="sidebar-foot">{{ resolutionPresetLabel(settings.compressResolution) }} · {{ qualityPresetLabel(settings.qualityPreset) }}</p>
+      <div class="sidebar-foot">
+        <p>{{ resolutionPresetLabel(settings.compressResolution) }} · {{ qualityPresetLabel(settings.qualityPreset) }}</p>
+        <p>v{{ appVersion }}</p>
+      </div>
     </aside>
 
     <main class="main">
@@ -364,6 +369,14 @@ const nav: { id: AppPage; label: string }[] = [
   color: var(--text-dim);
   font-size: 0.7rem;
   line-height: 1.35;
+}
+
+.sidebar-foot p {
+  margin: 0;
+}
+
+.sidebar-foot p + p {
+  margin-top: 2px;
 }
 
 .main {

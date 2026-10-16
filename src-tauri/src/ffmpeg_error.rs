@@ -20,6 +20,10 @@ pub const TRUNCATED: &str = "文件数据不完整：媒体内容被截断，多
 pub const DECODE_CORRUPTED: &str =
   "画面数据已损坏，无法解码：多半是下载不完整或源文件本身损坏，请重新下载该文件";
 
+/// 自带 AV1 解码器解不出达芬奇 / NVIDIA 导出的画面。
+pub const AV1_NATIVE_DECODE: &str =
+  "AV1 画面无法用自带解码器解开（常见于达芬奇或 NVIDIA 导出）。请更新应用后重试";
+
 /// 一帧都没写进输出，通常等于源文件里没有可解码的画面。
 pub const NO_VIDEO_PACKETS: &str =
   "源文件里没有可解码的画面数据：多半是文件只有元数据、没有正片内容（下载不完整），请重新下载该文件";
@@ -64,6 +68,10 @@ const RULES: &[(&[&str], &str)] = &[
       "decode_slice_header error",
     ],
     DECODE_CORRUPTED,
+  ),
+  (
+    &["decode error rate", "missing sequence header"],
+    AV1_NATIVE_DECODE,
   ),
   (
     &["nothing was written into output file", "received no packets"],
@@ -150,6 +158,16 @@ pub fn ffmpeg_failure_detail(stderr: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn classifies_native_av1_decode_failure_ahead_of_no_packets() {
+    let stderr = "\
+Error while filtering: Invalid data found when processing input
+[vist#0:0/av1 @ 0x1] Decode error rate 1 exceeds maximum 0.666667
+[out#0/mp4 @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.
+";
+    assert_eq!(classify(stderr), Some(AV1_NATIVE_DECODE));
+  }
 
   #[test]
   fn classifies_missing_packets_as_no_video_data() {

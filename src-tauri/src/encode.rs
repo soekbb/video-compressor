@@ -209,20 +209,64 @@ fn platform_hw_candidates() -> &'static [VideoEncoderKind] {
 /// NVIDIA/达芬奇的 AV1 序列头在 av1C 里。自带 `av1` 解码器会报 Missing Sequence Header，一帧都不出。
 /// `libdav1d` 更快；没有时用 `libaom-av1`。都没有则不要回退到自带解码器。
 pub fn select_av1_decoder<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
-  let mut has_aom = false;
+  let mut aom: Option<&'static str> = None;
   for name in names {
-    if name == "libdav1d" {
+    if name.eq_ignore_ascii_case("libdav1d") {
       return Some("libdav1d");
     }
-    if name == "libaom-av1" {
-      has_aom = true;
+    if name.eq_ignore_ascii_case("libaom-av1") {
+      aom = Some("libaom-av1");
+    } else if name.eq_ignore_ascii_case("libaom_av1") {
+      aom = Some("libaom_av1");
     }
   }
-  if has_aom {
-    Some("libaom-av1")
-  } else {
-    None
+  aom
+}
+
+/// ffprobe 有时把解码警告和编码名写在一起。只取第一条真正的编码名。
+pub fn codec_name_from_probe_stdout(stdout: &str) -> Option<String> {
+  for line in stdout.lines() {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('[') {
+      continue;
+    }
+    let token = line.split_whitespace().next()?;
+    if token.eq_ignore_ascii_case("n/a")
+      || token.eq_ignore_ascii_case("unknown")
+      || token.eq_ignore_ascii_case("none")
+    {
+      continue;
+    }
+    return Some(token.to_string());
   }
+  None
+}
+
+pub fn is_av1_codec_name(name: &str) -> bool {
+  matches!(
+    name.to_ascii_lowercase().as_str(),
+    "av1" | "av01" | "libaom-av1" | "libaom_av1"
+  )
+}
+
+/// 自带 `av1` 解码器把达芬奇 / NVIDIA 的 AV1 解成 0 帧时的 stderr。
+pub fn native_av1_decode_failure(stderr: &str) -> bool {
+  let lower = stderr.to_ascii_lowercase();
+  if lower.contains("/libaom") || lower.contains("/libdav1d") || lower.contains("libaom_av1") {
+    return false;
+  }
+  let native = lower.contains("/av1 ")
+    || lower.contains("/av1@")
+    || lower.contains("missing sequence header");
+  let failed = lower.contains("decode error rate")
+    || lower.contains("missing sequence header")
+    || lower.contains("nothing was written into output file");
+  native && failed
+}
+
+pub fn unknown_decoder_failure(stderr: &str) -> bool {
+  let lower = stderr.to_ascii_lowercase();
+  lower.contains("unknown decoder") || lower.contains("decoder not found")
 }
 
 fn decoder_names(ffmpeg: &Path) -> Vec<String> {
@@ -465,7 +509,29 @@ mod tests {
       Some("libdav1d")
     );
     assert_eq!(select_av1_decoder(["av1", "libaom-av1"]), Some("libaom-av1"));
+    assert_eq!(select_av1_decoder(["av1", "libaom_av1"]), Some("libaom_av1"));
     assert_eq!(select_av1_decoder(["av1"]), None);
+  }
+
+  #[test]
+  fn probe_stdout_ignores_av1_decoder_warnings() {
+    let raw = "[av1 @ 0x1] Missing Sequence Header.\nav1\n";
+    assert_eq!(codec_name_from_probe_stdout(raw).as_deref(), Some("av1"));
+    assert!(is_av1_codec_name("av1"));
+    assert!(is_av1_codec_name("AV01"));
+  }
+
+  #[test]
+  fn native_av1_failure_matches_resolve_export() {
+    let stderr = "\
+Error while filtering: Invalid data found when processing input
+[vist#0:0/av1 @ 0x1] Decode error rate 1 exceeds maximum 0.666667
+[out#0/mp4 @ 0x2] Nothing was written into output file, because at least one of its streams received no packets.
+";
+    assert!(native_av1_decode_failure(stderr));
+    assert!(!native_av1_decode_failure(
+      "[vist#0:0/libaom-av1 @ 0x1] Decode error rate 1 exceeds maximum 0.666667\n"
+    ));
   }
 
   #[test]

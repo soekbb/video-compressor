@@ -233,12 +233,8 @@ pub fn probe_video_codec(ffprobe: &Path, input: &Path) -> Result<String, String>
     return Err("无法读取视频编码器".into());
   }
 
-  let name = String::from_utf8_lossy(&output.stdout);
-  let name = name.trim();
-  if name.is_empty() {
-    return Err("无法读取视频编码器".into());
-  }
-  Ok(name.to_string())
+  crate::encode::codec_name_from_probe_stdout(&String::from_utf8_lossy(&output.stdout))
+    .ok_or_else(|| "无法读取视频编码器".to_string())
 }
 
 /// 校验输出与期望分辨率一致（压制/合成均须保持原分辨率）。
@@ -504,12 +500,9 @@ pub async fn compress_video(
   );
   let target_wh = target_canvas(preset_res, input_wh.0, input_wh.1);
   let codec = probe_video_codec(&ffprobe, &input)?;
-  let av1_decoder = if codec.eq_ignore_ascii_case("av1") {
-    Some(
-      crate::encode::preferred_av1_decoder(&ffmpeg).ok_or_else(|| {
-        "这份 FFmpeg 解不了 AV1（需要 libdav1d 或 libaom-av1）".to_string()
-      })?,
-    )
+  // 探测输出若混进解码警告，整段文字不会等于 "av1"，旧逻辑会漏掉并回退到自带解码器。
+  let av1_decoder = if crate::encode::is_av1_codec_name(&codec) {
+    Some(crate::encode::preferred_av1_decoder(&ffmpeg).unwrap_or("libaom-av1"))
   } else {
     None
   };
@@ -709,8 +702,12 @@ pub async fn compress_video(
     let encoders = encoder_fallback_chain(&ffmpeg);
     let mut last_err = String::from("压缩失败");
     let vf = letterbox_vf(target_wh.0, target_wh.1);
+    let mut av1_decoder = av1_decoder;
+    let mut native_av1_retried = false;
+    let mut aom_name_retried = false;
 
-    for (attempt, encoder) in encoders.into_iter().enumerate() {
+    'encode: loop {
+    for (attempt, encoder) in encoders.iter().copied().enumerate() {
       if cancel.is_cancelled(&cancel_key) {
         let _ = fs::remove_file(&encode_path_clone);
         return Err("已取消压缩".into());
@@ -860,11 +857,37 @@ pub async fn compress_video(
       last_err = format!("压缩失败（{}）：{detail}", encoder.ffmpeg_name());
       let _ = fs::remove_file(&encode_path_clone);
 
+      if av1_decoder == Some("libaom-av1")
+        && !aom_name_retried
+        && crate::encode::unknown_decoder_failure(&err_buf)
+      {
+        aom_name_retried = true;
+        av1_decoder = Some("libaom_av1");
+        continue 'encode;
+      }
+      if av1_decoder.is_none()
+        && !native_av1_retried
+        && crate::encode::native_av1_decode_failure(&err_buf)
+      {
+        native_av1_retried = true;
+        av1_decoder = Some(crate::encode::preferred_av1_decoder(&ffmpeg).unwrap_or("libaom-av1"));
+        let _ = app_for_progress.emit(
+          "compress-progress",
+          CompressProgressPayload {
+            id: id_for_progress.clone(),
+            progress: 0,
+          },
+        );
+        continue 'encode;
+      }
+
       if encoder == VideoEncoderKind::X264 {
-        break;
+        break 'encode;
       }
       // 硬编失败：累计次数，达阈值后冷却再试（非永久禁用）
       note_hw_encode_failed();
+    }
+    break;
     }
 
     let _ = fs::remove_file(&encode_path_clone);
